@@ -25,6 +25,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.databind.json.JsonMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.databind.type.TypeFactory;
@@ -530,6 +531,10 @@ public final class JsonUtils {
 
   public static ObjectNode getObjectNode() {
     return OBJECT_MAPPER.createObjectNode();
+  }
+
+  public static ArrayNode getArrayNode() {
+    return OBJECT_MAPPER.createArrayNode();
   }
 
   public static JsonNode readTree(String extensionJson) {

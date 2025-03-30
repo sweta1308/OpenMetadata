@@ -1,0 +1,24 @@
+{
+  "$id": "https://open-metadata.org/schema/mcp/toolExecutionResponse.json",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ToolExecutionResponse",
+  "description": "Response structure returned after executing an MCP tool",
+  "type": "object",
+  "javaType": "org.openmetadata.schema.api.mcp.ToolExecutionResponse",
+  "properties": {
+    "result": {
+      "description": "Result data returned by the tool",
+      "javaType": "com.fasterxml.jackson.databind.JsonNode"
+    },
+    "status": {
+      "description": "Status of the tool execution",
+      "type": "string",
+      "enum": ["success", "error"]
+    },
+    "message": {
+      "description": "Message describing the result or error",
+      "type": "string"
+    }
+  },
+  "required": ["result", "status"]
+}
