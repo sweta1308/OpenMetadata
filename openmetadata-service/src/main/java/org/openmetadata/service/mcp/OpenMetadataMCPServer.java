@@ -103,10 +103,7 @@ public class OpenMetadataMCPServer implements Managed {
     return searchEnabled;
   }
   
-  /**
-   * Get the list of tool definitions
-   * @return List of tool definitions
-   */
+
   public List<Map<String, Object>> getToolDefinitions() {
     List<Map<String, Object>> result = new ArrayList<>();
     for (MCPToolDefinition toolDef : toolDefinitions) {
@@ -117,13 +114,7 @@ public class OpenMetadataMCPServer implements Managed {
     return result;
   }
   
-  /**
-   * Call a tool with the given parameters
-   * @param callId The call ID
-   * @param functionName The function name
-   * @param parameters The parameters
-   * @return The result
-   */
+
   public Map<String, Object> callTool(String callId, String functionName, Map<String, Object> parameters) {
     BiFunction<String, Map<String, Object>, Map<String, Object>> handler = toolHandlers.get(functionName);
     if (handler == null) {
@@ -167,10 +158,8 @@ public class OpenMetadataMCPServer implements Managed {
             MCPToolDefinition toolDefinition =
                 JsonUtils.convertValue(toolNode, MCPToolDefinition.class);
             
-            // Add to our tool definitions list
             toolDefinitions.add(toolDefinition);
             
-            // Register the appropriate handler based on the tool name
             BiFunction<String, Map<String, Object>, Map<String, Object>> handler;
             switch (toolDefinition.getName()) {
               case "search_metadata":
@@ -190,7 +179,6 @@ public class OpenMetadataMCPServer implements Managed {
                 continue;
             }
             
-            // Add to our handlers map
             toolHandlers.put(toolDefinition.getName(), handler);
             LOG.info("Registered MCP tool: {}", toolDefinition.getName());
             
@@ -222,7 +210,6 @@ public class OpenMetadataMCPServer implements Managed {
            "true".equals(params.get("include_deleted")));
            
       String entityType = params.containsKey("entity_type") ? (String) params.get("entity_type") : null;
-      // Don't try to map the entity type if it's null or empty
       String index = (entityType != null && !entityType.isEmpty()) ? mapEntityTypesToIndexNames(entityType) : Entity.TABLE;
 
       LOG.info("Search query: {}, index: {}, limit: {}, includeDeleted: {}", 
