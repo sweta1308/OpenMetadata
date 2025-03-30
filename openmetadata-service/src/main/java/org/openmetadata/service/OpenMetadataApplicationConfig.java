@@ -33,6 +33,7 @@ import org.openmetadata.schema.api.security.jwt.JWTTokenConfiguration;
 import org.openmetadata.schema.configuration.LimitsConfiguration;
 import org.openmetadata.schema.security.secrets.SecretsManagerConfiguration;
 import org.openmetadata.schema.service.configuration.elasticsearch.ElasticSearchConfiguration;
+import org.openmetadata.service.config.MCPConfiguration;
 import org.openmetadata.service.config.OMWebConfiguration;
 import org.openmetadata.service.config.ObjectStorageConfiguration;
 import org.openmetadata.service.migration.MigrationConfiguration;
@@ -67,6 +68,9 @@ public class OpenMetadataApplicationConfig extends Configuration {
 
   @JsonProperty("pipelineServiceClientConfiguration")
   private PipelineServiceClientConfiguration pipelineServiceClientConfiguration;
+
+  @JsonProperty("mcpConfiguration")
+  private MCPConfiguration mcpConfiguration;
 
   private static final String CERTIFICATE_PATH = "certificatePath";
 

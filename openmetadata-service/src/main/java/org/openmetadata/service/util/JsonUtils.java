@@ -270,6 +270,17 @@ public final class JsonUtils {
   public static <T> T convertValue(Object object, TypeReference<T> toValueTypeRef) {
     return object == null ? null : OBJECT_MAPPER.convertValue(object, toValueTypeRef);
   }
+  
+  /**
+   * Converts an object to a JSON string.
+   *
+   * @param value object to be converted
+   * @return JSON string representation of the object
+   * @throws JsonProcessingException if the object cannot be converted to JSON
+   */
+  public static String writeValueAsString(Object value) throws JsonProcessingException {
+    return OBJECT_MAPPER.writeValueAsString(value);
+  }
 
   /** Applies the patch on original object and returns the updated object */
   public static JsonValue applyPatch(Object original, JsonPatch patch) {
@@ -702,4 +713,6 @@ public final class JsonUtils {
       return Json.createPatch(patchArray);
     }
   }
+
+  
 }

@@ -425,3 +425,15 @@ web:
   cache-control: ${WEB_CONF_CACHE_CONTROL:-""}
   pragma: ${WEB_CONF_PRAGMA:-""}
   
+mcpConfiguration:
+  enabled: ${MCP_ENABLED:-true}
+  websocketEndpoint: ${MCP_WEBSOCKET_ENDPOINT:-"/v1/mcp/ws"}
+  allowedOrigins: ${MCP_ALLOWED_ORIGINS:-"*"}
+  maxSessionIdleTimeMinutes: ${MCP_MAX_SESSION_IDLE_TIME:-30}
+  maxTextMessageSize: ${MCP_MAX_TEXT_MESSAGE_SIZE:-65536}
+  pingTimeoutSeconds: ${MCP_PING_TIMEOUT_SECONDS:-60}
+  jsonRpcEndpoint: ${MCP_JSONRPC_ENDPOINT:-"/v1/mcp/jsonrpc"}
+  mcpPort: ${MCP_PORT:-8586}
+  mcpServerName: ${MCP_SERVER_NAME:-"openmetadata-mcp"}
+  mcpServerVersion: ${MCP_SERVER_VERSION:-"1.0.0"}
+  
