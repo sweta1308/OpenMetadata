@@ -1,28 +1,17 @@
-/*
- *  Copyright 2021 Collate
- *  Licensed under the Apache License, Version 2.0 (the "License");
- *  you may not use this file except in compliance with the License.
- *  You may obtain a copy of the License at
- *  http://www.apache.org/licenses/LICENSE-2.0
- *  Unless required by applicable law or agreed to in writing, software
- *  distributed under the License is distributed on an "AS IS" BASIS,
- *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *  See the License for the specific language governing permissions and
- *  limitations under the License.
- */
-
 package org.openmetadata.service.mcp;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ArrayNode;
-import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.dropwizard.lifecycle.Managed;
+import io.modelcontextprotocol.server.transport.WebFluxSseServerTransportProvider;
+import io.modelcontextprotocol.spec.McpSchema;
+import io.modelcontextprotocol.spec.McpServerSession;
+import io.modelcontextprotocol.spec.McpServerTransport;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import org.eclipse.jetty.servlet.ServletHolder;
 import org.openmetadata.common.utils.CommonUtil;
-import org.openmetadata.schema.api.mcp.MCPToolDefinition;
 import org.openmetadata.schema.search.SearchRequest;
 import org.openmetadata.service.Entity;
 import org.openmetadata.service.config.MCPConfiguration;
@@ -30,199 +19,322 @@ import org.openmetadata.service.jdbi3.EntityRepository;
 import org.openmetadata.service.search.SearchRepository;
 import org.openmetadata.service.util.EntityUtil;
 import org.openmetadata.service.util.JsonUtils;
+import reactor.core.publisher.Mono;
 
-import javax.servlet.ServletException;
+import javax.servlet.AsyncContext;
+import javax.servlet.AsyncEvent;
+import javax.servlet.AsyncListener;
 import javax.servlet.http.HttpServlet;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
+import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.PrintWriter;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.function.BiFunction;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.util.concurrent.CompletableFuture;
+import java.time.Duration;
 
 import static org.openmetadata.service.search.SearchUtil.mapEntityTypesToIndexNames;
 
+/**
+ * A simple implementation of MCP server that handles the Model Context Protocol
+ * without external dependencies on Spring or the MCP SDK.
+ */
 @Slf4j
 public class OpenMetadataMCPServer implements Managed {
-  private static final String MCP_TOOLS_FILE = ".*json/data/mcp/tools.json$";
+  private static final String MCP_TOOLS_FILE = "json/data/mcp/tools.json";
 
   private final SearchRepository searchRepository;
-  private final Map<String, BiFunction<String, Map<String, Object>, Map<String, Object>>> toolHandlers = new HashMap<>();
-  private final MCPConfiguration mcpConfiguration;
-  @Getter private final List<MCPToolDefinition> toolDefinitions = new ArrayList<>();
-  private final MCPJsonRpcServlet servlet;
-  
-    private final String serverName;
-  private final String serverVersion;
-  private final boolean searchEnabled = true;
+  private final ExecutorService executorService;
+  private final MCPConfiguration mcpConfig;
+  private final ObjectMapper objectMapper;
+  private final Map<String, McpServerSession> sessions = new ConcurrentHashMap<>();
+  private final ScheduledExecutorService heartbeatExecutor = Executors.newScheduledThreadPool(
+      1, 
+      r -> {
+        Thread t = new Thread(r, "mcp-heartbeat-scheduler");
+        t.setDaemon(true);
+        return t;
+      }
+  );
+  private final Map<String, ScheduledFuture<?>> heartbeatTasks = new ConcurrentHashMap<>();
+  private List<Map<String, Object>> cachedTools;
+  private final Map<String, McpServerSession.RequestHandler<?>> cachedHandlers = new HashMap<>();
 
-  @Getter private ServletHolder servletHolder;
+  @Getter
+  private final ServletHolder servletHolder;
 
-  public OpenMetadataMCPServer(MCPConfiguration mcpConfiguration) {
-    this.mcpConfiguration = mcpConfiguration;
+  public OpenMetadataMCPServer(MCPConfiguration mcpConfig) {
+    this.mcpConfig = mcpConfig;
     this.searchRepository = Entity.getSearchRepository();
-    
-    this.serverName = mcpConfiguration.getMcpServerName();
-    this.serverVersion = mcpConfiguration.getMcpServerVersion();
-    
-    loadToolDefinitions();
-    
-    this.servlet = new MCPJsonRpcServlet(this);
-    this.servletHolder = new ServletHolder(servlet);
-    
-    LOG.info("Initialized MCP server with {} tools", toolHandlers.size());
+    this.executorService = Executors.newCachedThreadPool();
+    this.objectMapper = JsonUtils.getObjectMapper();
+
+    // Create a servlet that bridges to the WebFlux handlers
+    HttpServlet bridgeServlet = new MCPBridgeServlet();
+    this.servletHolder = new ServletHolder(bridgeServlet);
+
+    LOG.info("Initialized MCP server (using Servlet API)");
   }
 
   @Override
   public void start() {
-    LOG.info("Starting MCP server");
-    // Pre-load tool definitions to ensure they're ready when we receive the first request
-    if (toolDefinitions.isEmpty()) {
-      loadToolDefinitions();
+    LOG.info("Starting MCP server with configuration: {}", mcpConfig);
+    // Log server configuration details
+    LOG.info("MCP Server name: {}, version: {}", mcpConfig.getMcpServerName(), mcpConfig.getMcpServerVersion());
+    LOG.info("MCP Server path: {}", mcpConfig.getPath());
+    
+    // Pre-load tool definitions to verify they're available
+    try {
+      LOG.info("Loading tool definitions...");
+      cachedTools = loadToolDefinitions();
+      if (cachedTools == null || cachedTools.isEmpty()) {
+        LOG.error("No tool definitions were loaded!");
+        throw new RuntimeException("Failed to load tool definitions");
+      }
+      LOG.info("Successfully loaded {} tool definitions", cachedTools.size());
+      for (Map<String, Object> tool : cachedTools) {
+        LOG.info("Tool available: {}", tool.get("name"));
+      }
+      
+      // Initialize handlers once at startup
+      LOG.info("Initializing request handlers...");
+      initializeHandlers();
+      if (cachedHandlers.isEmpty()) {
+        LOG.error("No handlers were initialized!");
+        throw new RuntimeException("Failed to initialize handlers");
+      }
+      LOG.info("Successfully initialized handlers: {}", cachedHandlers.keySet());
+    } catch (Exception e) {
+      LOG.error("Error during server startup", e);
+      throw new RuntimeException("Failed to start MCP server", e);
     }
-    LOG.info("MCP server started with {} tools registered", toolHandlers.size());
   }
 
   @Override
   public void stop() {
     LOG.info("Stopping MCP server");
-  }
-  
-  public String getName() {
-    return serverName;
-  }
-
-  public String getVersion() {
-    return serverVersion;
-  }
-  
-
-  public boolean isSearchEnabled() {
-    return searchEnabled;
-  }
-  
-
-  public List<Map<String, Object>> getToolDefinitions() {
-    List<Map<String, Object>> result = new ArrayList<>();
-    for (MCPToolDefinition toolDef : toolDefinitions) {
-      // Convert the entire MCPToolDefinition to a Map<String, Object>
-      Map<String, Object> toolMap = JsonUtils.convertValue(toolDef, Map.class);
-      result.add(toolMap);
+    
+    // Shut down the executor service
+    executorService.shutdown();
+    
+    // Cancel all heartbeat tasks
+    for (Map.Entry<String, ScheduledFuture<?>> entry : heartbeatTasks.entrySet()) {
+      entry.getValue().cancel(false);
+      LOG.info("Canceled heartbeat task for session: {}", entry.getKey());
     }
-    return result;
-  }
-  
-
-  public Map<String, Object> callTool(String callId, String functionName, Map<String, Object> parameters) {
-    BiFunction<String, Map<String, Object>, Map<String, Object>> handler = toolHandlers.get(functionName);
-    if (handler == null) {
-      Map<String, Object> error = new HashMap<>();
-      error.put("error", "Tool not found: " + functionName);
-      return error;
+    heartbeatTasks.clear();
+    
+    // Shut down the heartbeat executor
+    try {
+      LOG.info("Shutting down heartbeat executor");
+      heartbeatExecutor.shutdown();
+      if (!heartbeatExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+        LOG.warn("Heartbeat executor did not terminate in time, forcing shutdown");
+        heartbeatExecutor.shutdownNow();
+      }
+    } catch (InterruptedException e) {
+      LOG.warn("Interrupted while waiting for heartbeat executor to shut down", e);
+      Thread.currentThread().interrupt();
+      heartbeatExecutor.shutdownNow();
     }
     
-    try {
-      return handler.apply(callId, parameters);
-    } catch (Exception e) {
-      LOG.error("Error executing tool: {} - {}", functionName, e.getMessage(), e);
-      Map<String, Object> error = new HashMap<>();
-      error.put("error", e.getMessage());
-      return error;
+    // Close all sessions
+    for (McpServerSession session : sessions.values()) {
+      session.closeGracefully().subscribe();
     }
+    sessions.clear();
+    
+    LOG.info("MCP server stopped");
   }
 
-  public void loadToolDefinitions() {
-    try {
-      // Clear existing definitions and handlers
-      toolDefinitions.clear();
-      toolHandlers.clear();
-      
-      List<String> jsonDataFiles = EntityUtil.getJsonDataResources(MCP_TOOLS_FILE);
-      if (!jsonDataFiles.isEmpty()) {
-        String json =
-            CommonUtil.getResourceAsStream(
-                EntityRepository.class.getClassLoader(), jsonDataFiles.get(0));
-
-        JsonNode toolsJson = JsonUtils.readTree(json);
-        JsonNode toolsArray = toolsJson.get("tools");
-
-        if (toolsArray == null || !toolsArray.isArray()) {
-          LOG.error("Invalid MCP tools file format. Expected 'tools' array.");
-          return;
-        }
-
-        for (JsonNode toolNode : toolsArray) {
-          try {
-            MCPToolDefinition toolDefinition =
-                JsonUtils.convertValue(toolNode, MCPToolDefinition.class);
-            
-            toolDefinitions.add(toolDefinition);
-            
-            BiFunction<String, Map<String, Object>, Map<String, Object>> handler;
-            switch (toolDefinition.getName()) {
-              case "search_metadata":
-                handler = this::searchMetadata;
-                break;
-              case "get_entity_details":
-                handler = this::getEntityDetails;
-                break;
-              case "nlq_search":
-                handler = this::nlqSearch;
-                break;
-              case "advanced_search":
-                handler = this::advancedSearch;
-                break;
-              default:
-                LOG.warn("Unknown tool definition: {}", toolDefinition.getName());
-                continue;
-            }
-            
-            toolHandlers.put(toolDefinition.getName(), handler);
-            LOG.info("Registered MCP tool: {}", toolDefinition.getName());
-            
-          } catch (Exception e) {
-            LOG.error("Error processing tool definition", e);
-          }
-        }
-
-        LOG.info("Registered {} MCP tools", toolHandlers.size());
-      }
-    } catch (Exception e) {
-      LOG.error("Error loading MCP tool definitions", e);
-    }
-  }
-
+  /**
+   * Loads tool definitions from the configured file.
+   */
   @SuppressWarnings("unchecked")
-  private Map<String, Object> searchMetadata(String callId, Map<String, Object> params) {
+  private List<Map<String, Object>> loadToolDefinitions() throws IOException {
+    try {
+      LOG.info("Starting to load tool definitions");
+      
+      // Load tool definitions directly from the file
+      String json = CommonUtil.getResourceAsStream(
+              getClass().getClassLoader(), 
+              "json/data/mcp/tools.json");
+      LOG.info("Loaded tool definitions, content length: {}", json.length());
+      
+      // Log the raw JSON content
+      LOG.info("Raw tools.json content: {}", json);
+      
+      JsonNode toolsJson = JsonUtils.readTree(json);
+      JsonNode toolsArray = toolsJson.get("tools");
+
+      if (toolsArray == null || !toolsArray.isArray()) {
+        LOG.error("Invalid MCP tools file format. Expected 'tools' array.");
+        return new ArrayList<>();
+      }
+      
+      // Convert tool definitions to a list of maps
+      List<Map<String, Object>> tools = new ArrayList<>();
+      for (JsonNode toolNode : toolsArray) {
+        String name = toolNode.get("name").asText();
+        Map<String, Object> toolDef = JsonUtils.convertValue(toolNode, Map.class);
+        tools.add(toolDef);
+        LOG.info("Tool found: {} with definition: {}", name, toolDef);
+      }
+      
+      LOG.info("Found {} tool definitions", tools.size());
+      return tools;
+    } catch (Exception e) {
+      LOG.error("Error loading tool definitions: {}", e.getMessage(), e);
+      throw e;
+    }
+  }
+
+  /**
+   * Initialize request handlers once at startup
+   */
+  private void initializeHandlers() {
+    LOG.info("Initializing request handlers");
+    
+    // Register tools/list request handler
+    LOG.info("Registering handler for method: tools/list");
+    cachedHandlers.put("tools/list", (exchange, params) -> {
+      LOG.info("Starting tools/list handler");
+      return Mono.<Object>defer(() -> {
+        try {
+          if (cachedTools == null) {
+            String error = "No cached tools available - tools were not initialized at startup";
+            LOG.error(error);
+            return Mono.error(new RuntimeException(error));
+          }
+          
+          LOG.info("Found {} cached tools", cachedTools.size());
+          List<Map<String, Object>> toolsFormatted = new ArrayList<>();
+          
+          for (Map<String, Object> toolDef : cachedTools) {
+            try {
+              String name = (String) toolDef.get("name");
+              String description = (String) toolDef.get("description");
+              Object parameters = toolDef.get("parameters");
+              
+              LOG.info("Processing tool: name={}, description={}", name, description);
+              
+              Map<String, Object> formattedTool = new HashMap<>();
+              formattedTool.put("name", name);
+              formattedTool.put("description", description);
+              formattedTool.put("parameters", parameters);
+              
+              toolsFormatted.add(formattedTool);
+            } catch (Exception e) {
+              LOG.error("Error processing tool definition: {}", toolDef, e);
+              // Continue processing other tools
+            }
+          }
+          
+          // Create a proper result object with the expected format
+          Map<String, Object> resultObj = new HashMap<>();
+          resultObj.put("tools", toolsFormatted);
+          
+          LOG.info("Successfully formatted {} tools", toolsFormatted.size());
+          return Mono.just(resultObj);
+        } catch (Exception e) {
+          LOG.error("Error in tools/list handler", e);
+          return Mono.error(e);
+        }
+      })
+      .doOnSubscribe(s -> LOG.info("tools/list handler subscribed"))
+      .doOnNext(result -> LOG.info("Got result from handler: {}", result))
+      .doOnSuccess(result -> LOG.info("tools/list handler completed successfully"))
+      .doOnError(error -> LOG.error("tools/list handler failed with error: {}", error.getMessage(), error))
+      .subscribeOn(reactor.core.scheduler.Schedulers.boundedElastic());
+    });
+    
+    // Register executeFunction request handler
+    cachedHandlers.put("executeFunction", (exchange, params) -> {
+      return Mono.defer(() -> {
+        try {
+          Map<String, Object> paramsMap = objectMapper.convertValue(params, Map.class);
+          String functionName = (String) paramsMap.get("name");
+          Map<String, Object> functionParams = (Map<String, Object>) paramsMap.get("parameters");
+          
+          Object result;
+          switch (functionName) {
+            case "search_metadata":
+              result = searchMetadata(functionParams);
+              break;
+            case "get_entity_details":
+              result = getEntityDetails(functionParams);
+              break;
+            default:
+              result = Map.of("error", "Unknown function: " + functionName);
+              break;
+          }
+          
+          return Mono.just(result);
+        } catch (Exception e) {
+          LOG.error("Error executing function", e);
+          return Mono.error(e);
+        }
+      });
+    });
+  }
+
+  /**
+   * Executes the search_metadata tool.
+   */
+  private Map<String, Object> searchMetadata(Map<String, Object> params) {
     try {
       LOG.info("Executing searchMetadata with params: {}", params);
       
       String query = params.containsKey("query") ? (String) params.get("query") : "*";
-      Integer limitObj = params.containsKey("limit") ? 
-          (params.get("limit") instanceof Number ? ((Number) params.get("limit")).intValue() : 
-           params.get("limit") instanceof String ? Integer.parseInt((String) params.get("limit")) : 10) : 10;
-      int limit = limitObj != null ? limitObj : 10;
+      int limit = 10;
+      if (params.containsKey("limit")) {
+        Object limitObj = params.get("limit");
+        if (limitObj instanceof Number) {
+          limit = ((Number) limitObj).intValue();
+        } else if (limitObj instanceof String) {
+          limit = Integer.parseInt((String) limitObj);
+        }
+      }
       
-      boolean includeDeleted = params.containsKey("include_deleted") && 
-          (params.get("include_deleted") instanceof Boolean ? (Boolean) params.get("include_deleted") : 
-           "true".equals(params.get("include_deleted")));
-           
+      boolean includeDeleted = false;
+      if (params.containsKey("include_deleted")) {
+        Object deletedObj = params.get("include_deleted");
+        if (deletedObj instanceof Boolean) {
+          includeDeleted = (Boolean) deletedObj;
+        } else if (deletedObj instanceof String) {
+          includeDeleted = "true".equals(deletedObj);
+        }
+      }
+      
       String entityType = params.containsKey("entity_type") ? (String) params.get("entity_type") : null;
-      String index = (entityType != null && !entityType.isEmpty()) ? mapEntityTypesToIndexNames(entityType) : Entity.TABLE;
+      String index = (entityType != null && !entityType.isEmpty()) 
+          ? mapEntityTypesToIndexNames(entityType) 
+          : Entity.TABLE;
 
       LOG.info("Search query: {}, index: {}, limit: {}, includeDeleted: {}", 
           query, index, limit, includeDeleted);
 
-      SearchRequest searchRequest =
-          new SearchRequest()
-              .withQuery(query)
-              .withIndex(index)
-              .withSize(limit)
-              .withFrom(0)
-              .withFetchSource(true)
-              .withDeleted(includeDeleted);
+      SearchRequest searchRequest = new SearchRequest()
+          .withQuery(query)
+          .withIndex(index)
+          .withSize(limit)
+          .withFrom(0)
+          .withFetchSource(true)
+          .withDeleted(includeDeleted);
 
       javax.ws.rs.core.Response response = searchRepository.search(searchRequest, null);
       
@@ -242,476 +354,750 @@ public class OpenMetadataMCPServer implements Managed {
     }
   }
 
-  @SuppressWarnings("unchecked")
-  private Map<String, Object> getEntityDetails(String callId, Map<String, Object> params) {
+  /**
+   * Get details for a specific entity by its FQN.
+   *
+   * @param params The parameters from the request
+   * @return The entity details
+   */
+  private Object getEntityDetails(Map<String, Object> params) {
     try {
       String entityType = (String) params.get("entity_type");
       String fqn = (String) params.get("fqn");
       
-      LOG.info("Getting entity details for type: {}, FQN: {}", entityType, fqn);
+      LOG.info("Getting details for entity type: {}, FQN: {}", entityType, fqn);
       
-      if (entityType == null || entityType.isEmpty()) {
-        throw new IllegalArgumentException("entity_type is required");
-      }
+      // Include all fields
+      String fields = "*";
       
-      if (fqn == null || fqn.isEmpty()) {
-        throw new IllegalArgumentException("fqn is required");
-      }
-      
-      EntityRepository<?> repository = Entity.getEntityRepository(entityType);
-      if (repository == null) {
-        throw new IllegalArgumentException("Invalid entity type: " + entityType);
-      }
-      
-      Object entity = repository.getByName(null, fqn, null);
-      if (entity == null) {
-        throw new IllegalArgumentException("Entity not found for FQN: " + fqn);
-      }
-
-      Map<String, Object> result = JsonUtils.convertValue(entity, Map.class);
-      LOG.info("Successfully retrieved entity: {}", fqn);
-      return result;
+      Object entity = Entity.getEntityByName(entityType, fqn, fields, null);
+      return entity;
     } catch (Exception e) {
-      LOG.error("Error in getEntityDetails", e);
-      Map<String, Object> error = new HashMap<>();
-      error.put("error", e.getMessage());
-      return error;
+      LOG.error("Error getting entity details", e);
+      return Map.of("error", e.getMessage());
     }
   }
 
-  @SuppressWarnings("unchecked")
-  private Map<String, Object> nlqSearch(String callId, Map<String, Object> params) {
-    try {
-      String query = (String) params.get("query");
+  /**
+   * A servlet that bridges HTTP requests to the WebFlux router functions.
+   */
+  private class MCPBridgeServlet extends HttpServlet {
+    @Override
+    protected void service(HttpServletRequest req, HttpServletResponse resp) 
+            throws IOException {
       
-      Integer limitObj = params.containsKey("limit") ? 
-          (params.get("limit") instanceof Number ? ((Number) params.get("limit")).intValue() : 
-           params.get("limit") instanceof String ? Integer.parseInt((String) params.get("limit")) : 10) : 10;
-      int limit = limitObj != null ? limitObj : 10;
+      // Add logging at the very start of the service method
+      String initialRequestId = req.getHeader("X-Request-ID"); // Or generate one if needed
+      if (initialRequestId == null) { initialRequestId = UUID.randomUUID().toString().substring(0, 8); }
+      LOG.info("[{}] MCPBridgeServlet service() entered for: {} {}", 
+          initialRequestId, req.getMethod(), req.getRequestURI());
       
-      String entityType = params.containsKey("entity_type") ? (String) params.get("entity_type") : "table";
-      // Safety check for entity type
-      if (entityType == null || entityType.isEmpty()) {
-        entityType = "table";
-      }
-      String index = mapEntityTypesToIndexNames(entityType);
-
-      SearchRequest searchRequest =
-          new SearchRequest()
-              .withQuery(query)
-              .withIndex(index)
-              .withSize(limit)
-              .withFrom(0)
-              .withFetchSource(true);
-
-      javax.ws.rs.core.Response response = searchRepository.searchWithNLQ(searchRequest, null);
+      String path = req.getRequestURI();
+      String method = req.getMethod();
       
-      if (response.getEntity() instanceof String responseStr) {
-        JsonNode jsonNode = JsonUtils.readTree(responseStr);
-        return JsonUtils.convertValue(jsonNode, Map.class);
-      } else {
-        return JsonUtils.convertValue(response.getEntity(), Map.class);
-      }
-    } catch (Exception e) {
-      LOG.error("Error in nlqSearch", e);
-      Map<String, Object> error = new HashMap<>();
-      error.put("error", e.getMessage());
-      return error;
-    }
-  }
-
-  @SuppressWarnings("unchecked")
-  private Map<String, Object> advancedSearch(String callId, Map<String, Object> params) {
-    try {
-      String query = (String) params.get("query");
+      // Track request timing
+      long startTime = System.currentTimeMillis();
+      String requestId = UUID.randomUUID().toString().substring(0, 8);
       
-      Integer limitObj = params.containsKey("limit") ? 
-          (params.get("limit") instanceof Number ? ((Number) params.get("limit")).intValue() : 
-           params.get("limit") instanceof String ? Integer.parseInt((String) params.get("limit")) : 10) : 10;
-      int limit = limitObj != null ? limitObj : 10;
-
-      String entityType = params.containsKey("entity_type") ? (String) params.get("entity_type") : null;
-      String index = (entityType != null && !entityType.isEmpty()) ? mapEntityTypesToIndexNames(entityType) : null;
-      
-      String sortField = params.containsKey("sort_field") ? (String) params.get("sort_field") : "_score";
-      String sortOrder = params.containsKey("sort_order") ? (String) params.get("sort_order") : "desc";
-      
-      LOG.info("Advanced search query: {}, index: {}, limit: {}, sortField: {}, sortOrder: {}", 
-          query, index, limit, sortField, sortOrder);
-
-      String queryFilter = null;
-      if (params.containsKey("filters") && params.get("filters") instanceof Map) {
-        StringBuilder filterBuilder = new StringBuilder();
-        Map<String, Object> filters = (Map<String, Object>) params.get("filters");
+      try {
+        LOG.info("[{}] Received request: {} {} from {}", 
+            requestId, 
+            req.getMethod(), 
+            req.getRequestURI(),
+            req.getRemoteAddr());
         
-        for (Map.Entry<String, Object> entry : filters.entrySet()) {
-          if (filterBuilder.length() > 0) {
-            filterBuilder.append(" AND ");
-          }
-          filterBuilder.append(entry.getKey()).append(":");
+        // Log headers for debugging
+        java.util.Enumeration<String> headerNames = req.getHeaderNames();
+        while (headerNames.hasMoreElements()) {
+          String headerName = headerNames.nextElement();
+          LOG.debug("[{}] Header: {} = {}", requestId, headerName, req.getHeader(headerName));
+        }
+        
+        // Set content type explicitly for all responses
+        resp.setContentType("application/json");
+        resp.setCharacterEncoding("UTF-8");
+
+        // Forward the request using the WebFlux transport
+        if (req.getMethod().equals("GET") && path.endsWith("/sse")) {
+          LOG.info("[{}] Handling SSE connection request", requestId);
+          // Handle SSE connection with proper headers
+          resp.setContentType("text/event-stream");
+          resp.setCharacterEncoding("UTF-8");
+          resp.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+          resp.setHeader("Pragma", "no-cache");
+          resp.setHeader("Expires", "0");
+          resp.setHeader("Connection", "keep-alive");
           
-          if (entry.getValue() instanceof String) {
-            filterBuilder.append((String) entry.getValue());
-          } else if (entry.getValue() instanceof List) {
-            filterBuilder.append("(");
-            List<Object> list = (List<Object>) entry.getValue();
-            for (int i = 0; i < list.size(); i++) {
-              if (i > 0) {
-                filterBuilder.append(" OR ");
-              }
-              filterBuilder.append(list.get(i).toString());
-            }
-            filterBuilder.append(")");
-          } else {
-            filterBuilder.append(entry.getValue().toString());
-          }
-        }
-        
-        queryFilter = filterBuilder.toString();
-      }
-      
-      SearchRequest searchRequest =
-          new SearchRequest()
-              .withQuery(query)
-              .withIndex(index)
-              .withSize(limit)
-              .withFrom(0)
-              .withFetchSource(true)
-              .withSortFieldParam(sortField)
-              .withSortOrder(sortOrder)
-              .withQueryFilter(queryFilter);
-      
-      javax.ws.rs.core.Response response = searchRepository.search(searchRequest, null);
-      
-      if (response.getEntity() instanceof String responseStr) {
-        JsonNode jsonNode = JsonUtils.readTree(responseStr);
-        return JsonUtils.convertValue(jsonNode, Map.class);
-      } else {
-        return JsonUtils.convertValue(response.getEntity(), Map.class);
-      }
-    } catch (Exception e) {
-      LOG.error("Error in advancedSearch", e);
-      Map<String, Object> error = new HashMap<>();
-      error.put("error", e.getMessage());
-      return error;
-    }
-  }
-  
-  /**
-   * Returns the HTTP servlet for the MCP server, which can be registered with a servlet container
-   */
-  public HttpServlet getServlet() {
-    return servlet;
-  }
-  
-  /**
-   * Custom JSON-RPC 2.0 servlet for MCP protocol
-   */
-  @Slf4j
-  private static class MCPJsonRpcServlet extends HttpServlet {
-    private final OpenMetadataMCPServer mcpServer;
-    private final ObjectMapper objectMapper;
-    
-    public MCPJsonRpcServlet(OpenMetadataMCPServer mcpServer) {
-      this.mcpServer = mcpServer;
-      this.objectMapper = JsonUtils.getObjectMapper();
-    }
-    
-    @Override
-    protected void doOptions(HttpServletRequest request, HttpServletResponse response) 
-        throws ServletException, IOException {
-      setCorsHeaders(response);
-      response.setStatus(HttpServletResponse.SC_OK);
-    }
-    
-    @Override
-    protected void doPost(HttpServletRequest request, HttpServletResponse response) 
-        throws ServletException, IOException {
-      
-      response.setContentType("application/json");
-      response.setCharacterEncoding("UTF-8");
-      setCorsHeaders(response);
-      
-      try {
-        JsonNode requestNode = objectMapper.readTree(request.getInputStream());
-        String jsonrpc = requestNode.has("jsonrpc") ? requestNode.get("jsonrpc").asText() : null;
-        String method = requestNode.has("method") ? requestNode.get("method").asText() : null;
-        String id = requestNode.has("id") ? (requestNode.get("id").isTextual() ? 
-            requestNode.get("id").asText() : requestNode.get("id").toString()) : null;
-        JsonNode params = requestNode.has("params") ? requestNode.get("params") : null;
-        
-        LOG.info("Received JSON-RPC request: method={}, id={}, jsonrpc={}", method, id, jsonrpc);
-        
-        boolean isNotification = method != null && (method.startsWith("notifications/"));
-        
-        if (method == null || (id == null && !isNotification) || !"2.0".equals(jsonrpc)) {
-          LOG.warn("Invalid JSON-RPC request: method={}, id={}, jsonrpc={}, isNotification={}", 
-                   method, id, jsonrpc, isNotification);
-          sendError(response, id, -32600, "Invalid JSON-RPC request");
-          return;
-        }
-        
-        JsonNode result;
-        
-        switch (method) {
-          case "initialize":
-            LOG.info("Processing initialize request with id: {}", id);
-            result = handleInitialize(id, requestNode);
-            break;
-          case "executeFunction":
-            LOG.info("Processing executeFunction request with id: {}", id);
-            result = handleExecuteFunction(id, params);
-            break;
-          case "tools/list":
-            LOG.info("Processing tools/list request with id: {}", id);
-            result = handleToolsList();
-            break;
-          case "resources/list":
-            LOG.info("Processing resources/list request with id: {}", id);
-            result = objectMapper.createArrayNode();
-            break;
-          case "prompts/list":
-            LOG.info("Processing prompts/list request with id: {}", id);
-            result = objectMapper.createArrayNode();
-            break;
-          case "notifications/initialized":
-            LOG.info("Received notifications/initialized with id: {}", id);
-            result = objectMapper.nullNode();
-            break;
-          case "notifications/cancelled":
-            LOG.info("Received notifications/cancelled notification with params: {}", params);
-            result = objectMapper.nullNode();
-            break;
-          default:
-            LOG.warn("Unknown method: {}", method);
-            sendError(response, id, -32601, "Method not found: " + method);
+          // Basic CORS headers
+          resp.setHeader("Access-Control-Allow-Origin", "*");
+          resp.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+          resp.setHeader("Access-Control-Allow-Headers", "*");
+          
+          resp.setStatus(HttpServletResponse.SC_OK);
+          
+          // Handle CORS preflight requests
+          if (req.getMethod().equals("OPTIONS")) {
+            LOG.info("[{}] Handling CORS preflight request", requestId);
+            resp.setHeader("Access-Control-Max-Age", "86400"); // 24 hours
+            resp.setStatus(HttpServletResponse.SC_OK);
+            resp.getWriter().flush();
             return;
-        }
-        
-        // Send success response
-        ObjectNode responseObj = objectMapper.createObjectNode();
-        responseObj.put("jsonrpc", "2.0");
-        responseObj.put("id", id);
-        responseObj.set("result", result);
-        
-        String responseJson = objectMapper.writeValueAsString(responseObj);
-        LOG.info("Sending JSON-RPC response for method '{}' with id '{}': {}", method, id, responseJson);
-        
-        // Important: Make sure to set the appropriate content headers
-        response.setContentType("application/json");
-        response.setCharacterEncoding("UTF-8");
-        
-        objectMapper.writeValue(response.getOutputStream(), responseObj);
-        response.flushBuffer();
-        LOG.info("Response sent successfully for method: {}", method);
-        
-      } catch (Exception e) {
-        LOG.error("Error processing JSON-RPC request", e);
-        sendError(response, null, -32700, "Parse error: " + e.getMessage());
-      }
-    }
-    
-    private void sendError(HttpServletResponse response, String id, int code, String message) 
-        throws IOException {
-      
-      ObjectNode responseObj = objectMapper.createObjectNode();
-      responseObj.put("jsonrpc", "2.0");
-      if (id != null) {
-        responseObj.put("id", id);
-      } else {
-        responseObj.putNull("id");
-      }
-      
-      ObjectNode error = objectMapper.createObjectNode();
-      error.put("code", code);
-      error.put("message", message);
-      
-      responseObj.set("error", error);
-      
-      LOG.warn("Sending error response: {}", responseObj);
-      objectMapper.writeValue(response.getOutputStream(), responseObj);
-      response.flushBuffer();
-    }
-    
-    @SuppressWarnings("unchecked")
-    private JsonNode handleExecuteFunction(String id, JsonNode params) {
-      try {
-        LOG.info("executeFunction request with id: {}, params: {}", id, params);
-        
-        if (params == null || !params.has("name") || !params.has("parameters")) {
-          throw new IllegalArgumentException("Invalid executeFunction params");
-        }
-        
-        String functionName = params.get("name").asText();
-        Map<String, Object> parameters = objectMapper.convertValue(
-            params.get("parameters"), Map.class);
-        
-        LOG.info("Executing function '{}' with parameters: {}", functionName, parameters);
-        Map<String, Object> result = mcpServer.callTool(id, functionName, parameters);
-        ObjectNode response = objectMapper.createObjectNode();
-        response.put("name", functionName);
-
-        if (result.containsKey("error")) {
-          LOG.error("Function execution error: {}", result.get("error"));
-          ObjectNode errorObj = objectMapper.createObjectNode();
-          errorObj.put("error", String.valueOf(result.get("error")));
-          response.set("content", errorObj);
-        } else {
-          response.set("content", objectMapper.valueToTree(result));
-        }
-        
-        LOG.info("Function response for id {}: {}", id, response);
-        return response;
-      } catch (Exception e) {
-        LOG.error("Error executing function for id {}: {}", id, e.getMessage(), e);
-        ObjectNode response = objectMapper.createObjectNode();
-        if (params != null && params.has("name")) {
-          response.put("name", params.get("name").asText());
-        } else {
-          response.put("name", "unknown");
-        }
-        
-        ObjectNode errorContent = objectMapper.createObjectNode();
-        errorContent.put("error", e.getMessage());
-        response.set("content", errorContent);
-        
-        return response;
-      }
-    }
-
-    private JsonNode handleInitialize(String id, JsonNode requestNode) {
-      try {
-        // Ensure we have tools loaded
-        if (mcpServer.getToolDefinitions().isEmpty()) {
-          LOG.info("No tools loaded, reloading tool definitions");
-          mcpServer.loadToolDefinitions();
-        }
-        
-        ObjectNode result = objectMapper.createObjectNode();
-
-        // Add server info
-        ObjectNode serverInfo = objectMapper.createObjectNode();
-        serverInfo.put("name", mcpServer.getName());
-        serverInfo.put("version", mcpServer.getVersion());
-        result.set("serverInfo", serverInfo);
-
-        // Add capabilities exactly as Claude expects
-        ObjectNode capabilities = objectMapper.createObjectNode();
-        capabilities.put("search", mcpServer.isSearchEnabled());
-        result.set("capabilities", capabilities);
-
-        // Add protocol version - check if we have protocol version in the request
-        if (requestNode != null && requestNode.has("params") && 
-            requestNode.get("params").has("protocolVersion")) {
-          String protocolVersion = requestNode.get("params").get("protocolVersion").asText();
-          result.put("protocolVersion", protocolVersion);
-          LOG.info("Using protocol version from client: {}", protocolVersion);
-        } else {
-          // Use exactly the version Claude sent in the initialize message
-          result.put("protocolVersion", "2024-11-05");
-          LOG.info("Using default protocol version: 2024-11-05");
-        }
-        
-        LOG.info("Full initialize response: {}", result);
-
-        ArrayNode functions = objectMapper.createArrayNode();
-        for (Map<String, Object> toolDef : mcpServer.getToolDefinitions()) {
-          ObjectNode functionNode = objectMapper.createObjectNode();
-          functionNode.put("name", (String) toolDef.get("name"));
-          functionNode.put("description", (String) toolDef.get("description"));
-
-          ObjectNode parameters = objectMapper.createObjectNode();
-          parameters.put("type", "object");
-
-          ObjectNode properties = objectMapper.createObjectNode();
-          Map<String, Object> paramsMap = (Map<String, Object>) toolDef.get("parameters");
-          if (paramsMap.containsKey("properties")) {
-            properties = (ObjectNode) JsonUtils.valueToTree(paramsMap.get("properties"));
           }
-          parameters.set("properties", properties);
-
-          ArrayNode required = objectMapper.createArrayNode();
-          if (paramsMap.containsKey("required")) {
-            Object reqObj = paramsMap.get("required");
-            if (reqObj instanceof List) {
-              for (Object item : (List<?>) reqObj) {
-                required.add(item.toString());
+          
+          // Switch to asynchronous mode
+          final AsyncContext asyncContext = req.startAsync();
+          
+          // Set a very long timeout to effectively disable it
+          asyncContext.setTimeout(3600000); // 1 hour
+          
+          // Generate a session ID
+          final String sessionId = UUID.randomUUID().toString();
+          LOG.info("[{}] Created new SSE session: {}", requestId, sessionId);
+          
+          // Keep track of whether the connection is closed
+          final AtomicBoolean closed = new AtomicBoolean(false);
+          
+          // Create an async writer to handle background writing
+          PrintWriter writer = resp.getWriter();
+          
+          // Write the initial endpoint event
+          String messageEndpoint = mcpConfig.getPath() + "/message?sessionId=" + sessionId;
+          
+          // Use the server's host from configuration instead of hardcoding localhost
+          String serverHost = req.getServerName();
+          int serverPort = req.getServerPort();
+          String fullMessageEndpoint = "http://" + serverHost + ":" + serverPort + messageEndpoint;
+          
+          writer.write("event: endpoint\n");
+          writer.write("data: " + fullMessageEndpoint + "\n\n");
+          writer.flush();
+          LOG.info("[{}] Sent initial endpoint event for session: {}", requestId, sessionId);
+          LOG.info("[{}] Message endpoint URL: {}", requestId, fullMessageEndpoint);
+          
+          // Create a transport that writes directly to the writer
+          McpServerTransport transport = new McpServerTransport() {
+              private final PrintWriter asyncWriter = asyncContext.getResponse().getWriter();
+              
+              @Override
+              public Mono<Void> sendMessage(McpSchema.JSONRPCMessage message) {
+                  if (closed.get()) {
+                      LOG.warn("[{}] Attempted to send message on closed SSE connection: {}", sessionId, message);
+                      return Mono.error(new IOException("SSE connection closed")); // Signal error if closed
+                  }
+                  
+                  return Mono.fromCallable(() -> {
+                      try {
+                          String json = objectMapper.writeValueAsString(message);
+                          LOG.info("[{}] Sending SSE message: {}", sessionId, json);
+                          
+                          synchronized (asyncWriter) {
+                              asyncWriter.write("event: message\n");
+                              asyncWriter.write("data: " + json + "\n\n");
+                              asyncWriter.flush();
+                              
+                              if (asyncWriter.checkError()) {
+                                  throw new IOException("PrintWriter error during SSE send");
+                              }
+                          }
+                          return null;
+                      } catch (Exception e) {
+                          LOG.error("[{}] Error sending SSE message: {}", sessionId, e.getMessage());
+                          throw e;
+                      }
+                  }).then();
               }
-            } else if (reqObj != null) {
-              required.add(reqObj.toString());
-            }
-          }
-          parameters.set("required", required);
-
-          functionNode.set("parameters", parameters);
-          functions.add(functionNode);
-        }
-        result.set("functions", functions);
-
-        LOG.info("Initialize response: {}", result);
-        return result;
-      } catch (Exception e) {
-        LOG.error("Error handling initialize", e);
-        ObjectNode error = objectMapper.createObjectNode();
-        error.put("error", e.getMessage());
-        return error;
-      }
-    }
-
-    private JsonNode handleToolsList() {
-      try {
-        LOG.info("Handling tools/list request");
-        ArrayNode toolsArray = objectMapper.createArrayNode();
-        List<Map<String, Object>> toolDefs = mcpServer.getToolDefinitions();
-        LOG.info("Got {} tool definitions", toolDefs.size());
-
-        for (Map<String, Object> toolDef : toolDefs) {
-          ObjectNode toolNode = objectMapper.createObjectNode();
-          toolNode.put("name", (String) toolDef.get("name"));
-          toolNode.put("description", (String) toolDef.get("description"));
-          Map<String, Object> paramsMap = (Map<String, Object>) toolDef.get("parameters");
-          ObjectNode parametersNode = objectMapper.createObjectNode();
-
-          parametersNode.put("type", "object");
-
-          ObjectNode propertiesNode = objectMapper.createObjectNode();
-          if (paramsMap != null && paramsMap.containsKey("properties")) {
-            Map<String, Object> props = (Map<String, Object>) paramsMap.get("properties");
-            for (Map.Entry<String, Object> entry : props.entrySet()) {
-              propertiesNode.set(entry.getKey(), JsonUtils.valueToTree(entry.getValue()));
-            }
-          }
-          parametersNode.set("properties", propertiesNode);
-          ArrayNode requiredArray = objectMapper.createArrayNode();
-          if (paramsMap != null && paramsMap.containsKey("required")) {
-            Object req = paramsMap.get("required");
-            if (req instanceof List) {
-              for (Object item : (List<?>) req) {
-                requiredArray.add(item.toString());
+              
+              @Override
+              public <T> T unmarshalFrom(Object data, TypeReference<T> typeRef) {
+                  return objectMapper.convertValue(data, typeRef);
               }
-            } else if (req instanceof String) {
-              requiredArray.add((String) req);
+              
+              @Override
+              public Mono<Void> closeGracefully() {
+                  closed.set(true);
+                  return Mono.empty();
+              }
+              
+              @Override
+              public void close() {
+                  closed.set(true);
+              }
+          };
+          
+          // Create a session using the simpler approach
+          McpServerSession session = createSession(sessionId, transport);
+          
+          // Send initial heartbeat with the exact format expected
+          try {
+              writer.write("event: heartbeat\n");
+              writer.write("data: {\"timestamp\":" + System.currentTimeMillis() + "}\n\n");
+              writer.flush();
+              LOG.info("[{}] Sent initial heartbeat for session: {}", requestId, sessionId);
+          } catch (Exception e) {
+              LOG.error("[{}] Error sending initial heartbeat: {}", requestId, e.getMessage());
+          }
+          
+          // Create a thread to send periodic heartbeats
+          Thread heartbeatThread = new Thread(() -> {
+              try {
+                  Thread.currentThread().setName("mcp-heartbeat-" + sessionId.substring(0, 8));
+                  LOG.info("Started heartbeat thread for session: {}", sessionId);
+                  
+                  int pingCount = 0;
+                  long lastHeartbeatTime = System.currentTimeMillis();
+                  
+                  while (!Thread.currentThread().isInterrupted() && !closed.get()) {
+                      try {
+                          // Determine if we should send a heartbeat or just a ping
+                          long now = System.currentTimeMillis();
+                          boolean sendHeartbeat = (now - lastHeartbeatTime) >= 5000; // Every 5 seconds
+                          
+                          if (sendHeartbeat) {
+                              // Send a proper heartbeat event
+                              writer.write("event: heartbeat\n");
+                              writer.write("data: {\"timestamp\":" + now + "}\n\n");
+                              writer.flush();
+                              lastHeartbeatTime = now;
+                              pingCount = 0;
+                              LOG.debug("Sent heartbeat for session: {}", sessionId);
+                          } else {
+                              // Send a comment ping
+                              writer.write(": ping-" + (++pingCount) + "\n\n");
+                              writer.flush();
+                              LOG.debug("Sent ping for session: {}", sessionId);
+                          }
+                          
+                          // Sleep before next ping/heartbeat
+                          Thread.sleep(1000);
+                      } catch (InterruptedException e) {
+                          Thread.currentThread().interrupt();
+                          LOG.info("Heartbeat thread interrupted for session: {}", sessionId);
+                          break;
+                      } catch (Exception e) {
+                          if (e.getMessage() != null && 
+                              (e.getMessage().contains("Broken pipe") || 
+                               e.getMessage().contains("Connection reset"))) {
+                              LOG.info("Client disconnected (detected in heartbeat): {}", sessionId);
+                          } else {
+                              LOG.error("Error in heartbeat thread: {}", e.getMessage(), e);
+                          }
+                          break;
+                      }
+                  }
+                  
+                  LOG.info("Heartbeat thread exiting for session: {}", sessionId);
+                  
+                  // Clean up resources
+                  closed.set(true);
+                  sessions.remove(sessionId);
+                  
+                  // Complete the async context
+                  try {
+                      asyncContext.complete();
+                  } catch (Exception e) {
+                      LOG.error("Error completing async context: {}", e.getMessage());
+                  }
+              } catch (Exception e) {
+                  LOG.error("Unhandled error in heartbeat thread: {}", e.getMessage(), e);
+              }
+          });
+          heartbeatThread.setDaemon(true);
+          heartbeatThread.start();
+          
+          // Set a listener to detect when the client disconnects
+          asyncContext.addListener(new AsyncListener() {
+              @Override
+              public void onComplete(AsyncEvent event) {
+                  LOG.info("Async context completed for session: {}", sessionId);
+                  cleanup();
+              }
+              
+              @Override
+              public void onTimeout(AsyncEvent event) {
+                  LOG.info("Async context timed out for session: {}", sessionId);
+                  cleanup();
+              }
+              
+              @Override
+              public void onError(AsyncEvent event) {
+                  LOG.info("Async context error for session: {}: {}", 
+                      sessionId, event.getThrowable() != null ? event.getThrowable().getMessage() : "unknown");
+                  cleanup();
+              }
+              
+              @Override
+              public void onStartAsync(AsyncEvent event) {
+                  // Nothing to do
+              }
+              
+              private void cleanup() {
+                  // Mark the connection as closed
+                  closed.set(true);
+                  
+                  // Remove the session
+                  sessions.remove(sessionId);
+                  
+                  // Interrupt the heartbeat thread
+                  heartbeatThread.interrupt();
+                  
+                  LOG.info("Cleaned up resources for session: {}", sessionId);
+              }
+          });
+          
+          // The request is now being handled asynchronously, so return from the service method
+          return;
+        } else if (req.getMethod().equals("POST") && 
+                  (path.contains("/message"))) {
+          LOG.info("[{}] Entered POST /message handler for path: {}", requestId, path);
+          // Handle JSON-RPC message
+          resp.setContentType("application/json");
+          
+          // Add CORS headers for the POST message endpoint as well
+          resp.setHeader("Access-Control-Allow-Origin", "*");
+          resp.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+          resp.setHeader("Access-Control-Allow-Headers", "*");
+          
+          // Handle potential CORS preflight (OPTIONS) request for this endpoint
+          if (req.getMethod().equals("OPTIONS")) {
+              LOG.info("[{}] Handling CORS preflight request for /message", requestId);
+              resp.setHeader("Access-Control-Max-Age", "86400"); // 24 hours
+              resp.setStatus(HttpServletResponse.SC_OK);
+              resp.getWriter().flush();
+              return;
+          }
+          
+          // Get the session ID from the query parameter
+          String sessionId = req.getParameter("sessionId");
+          if (sessionId == null) {
+            LOG.warn("[{}] No session ID provided in POST request", requestId);
+            // Try to extract from URL path as fallback
+            String[] pathParts = path.split("/");
+            for (int i = 0; i < pathParts.length - 1; i++) {
+              if (pathParts[i].equals("message") && i + 1 < pathParts.length) {
+                sessionId = pathParts[i + 1];
+                break;
+              }
+            }
+            
+            if (sessionId == null) {
+              LOG.error("[{}] Cannot process JSON-RPC message without a session ID", requestId);
+              resp.setStatus(HttpServletResponse.SC_BAD_REQUEST);
+              resp.getWriter().write("{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32000,\"message\":\"Session ID is required\"},\"id\":null}");
+              resp.getWriter().flush();
+              return;
             }
           }
-          parametersNode.set("required", requiredArray);
-          toolNode.set("parameters", parametersNode);
-          toolsArray.add(toolNode);
-        }
+          
+          // Get the session from the map
+          McpServerSession session = sessions.get(sessionId);
+          if (session == null) {
+            LOG.error("[{}] Session not found: {}", requestId, sessionId);
+            resp.setStatus(HttpServletResponse.SC_BAD_REQUEST);
+            resp.getWriter().write("{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32000,\"message\":\"Session not found\"},\"id\":null}");
+            resp.getWriter().flush();
+            return;
+          }
+          
+          LOG.info("[{}] Processing JSON-RPC message for session: {}", requestId, sessionId);
+          
+          // Read the request body here, inside the specific handler
+          String requestBodyStr;
+          // Read the request body directly
+          StringBuilder requestBody = new StringBuilder();
+          String line;
+          try (BufferedReader reader = req.getReader()) {
+              while ((line = reader.readLine()) != null) {
+                  requestBody.append(line);
+              }
+          } // try-with-resources ensures reader is closed
+          requestBodyStr = requestBody.toString();
+          
+          // Parse and handle the JSON-RPC message
+          try {
+            McpSchema.JSONRPCMessage message = McpSchema.deserializeJsonRpcMessage(objectMapper, requestBodyStr);
+            LOG.info("Processing message: {} (type: {})", message, message.getClass().getSimpleName());
+            
+            // Also log the raw request body for debugging
+            if (requestBodyStr.length() < 1000) {
+              LOG.info("Raw request body: {}", requestBodyStr);
+            } else {
+              LOG.info("Raw request body (truncated): {}", requestBodyStr.substring(0, 1000));
+            }
+            
+            // Process the message through the session
+            if (message instanceof McpSchema.JSONRPCRequest request) {
+              LOG.info("Passing request to session handler: method={}, id={}, available handlers={}", 
+                  request.method(), 
+                  request.id(),
+                  createRequestHandlers().keySet());
+              try {
+                // Create a CompletableFuture to track completion
+                CompletableFuture<Void> future = new CompletableFuture<>();
+                final PrintWriter responseWriter = resp.getWriter();
+                
+                LOG.info("About to handle request with method: {}", request.method());
 
-        LOG.info("Returning {} tools in response", toolsArray.size());
-        return toolsArray;
+                // Special handling for tools/list method to bypass session handler
+                if ("tools/list".equals(request.method())) {
+                  LOG.info("Handling tools/list method directly instead of through session");
+                  try {
+                    // Create a proper result object with the expected format
+                    Map<String, Object> resultObj = new HashMap<>();
+                    List<Map<String, Object>> formattedTools = new ArrayList<>();
+                    
+                    if (cachedTools != null) {
+                      for (Map<String, Object> toolDef : cachedTools) {
+                        try {
+                          String name = (String) toolDef.get("name");
+                          String description = (String) toolDef.get("description");
+                          Object parameters = toolDef.get("parameters");
+                          
+                          Map<String, Object> formattedTool = new HashMap<>();
+                          formattedTool.put("name", name);
+                          formattedTool.put("description", description);
+                          formattedTool.put("parameters", parameters);
+                          
+                          formattedTools.add(formattedTool);
+                          LOG.info("Added tool to response: {}", name);
+                        } catch (Exception e) {
+                          LOG.error("Error processing tool definition: {}", toolDef, e);
+                          // Continue processing other tools
+                        }
+                      }
+                    } else {
+                      LOG.warn("No cached tools available when handling tools/list directly");
+                    }
+                    
+                    resultObj.put("tools", formattedTools);
+                    
+                    // Create JSON-RPC response
+                    Map<String, Object> response = new HashMap<>();
+                    response.put("jsonrpc", "2.0");
+                    response.put("id", request.id());
+                    response.put("result", resultObj);
+                    
+                    // Write response directly to HTTP response
+                    String json = objectMapper.writeValueAsString(response);
+                    resp.getWriter().write(json);
+                    resp.getWriter().flush();
+                    LOG.info("Sent direct tools/list response with {} tools", formattedTools.size());
+                    
+                    // Send 200 OK for the HTTP response
+                    resp.setStatus(HttpServletResponse.SC_OK);
+                    return;
+                  } catch (Exception e) {
+                    LOG.error("Error in direct tools/list handling", e);
+                    handleError(resp, e);
+                    return;
+                  }
+                }
+                
+                // Special handling for executeFunction method to bypass session handler
+                else if ("executeFunction".equals(request.method())) {
+                  LOG.info("Handling executeFunction method directly instead of through session");
+                  try {
+                    Map<String, Object> paramsMap = objectMapper.convertValue(request.params(), Map.class);
+                    String functionName = (String) paramsMap.get("name");
+                    Map<String, Object> functionParams = (Map<String, Object>) paramsMap.get("parameters");
+                    
+                    LOG.info("Executing function: {} with params: {}", functionName, functionParams);
+                    
+                    Object result;
+                    switch (functionName) {
+                      case "search_metadata":
+                        result = searchMetadata(functionParams);
+                        break;
+                      case "get_entity_details":
+                        result = getEntityDetails(functionParams);
+                        break;
+                      default:
+                        result = Map.of("error", "Unknown function: " + functionName);
+                        break;
+                    }
+                    
+                    // Create JSON-RPC response
+                    Map<String, Object> response = new HashMap<>();
+                    response.put("jsonrpc", "2.0");
+                    response.put("id", request.id());
+                    response.put("result", result);
+                    
+                    // Write response directly to HTTP response
+                    String json = objectMapper.writeValueAsString(response);
+                    resp.getWriter().write(json);
+                    resp.getWriter().flush();
+                    LOG.info("Sent direct executeFunction response for function: {}", functionName);
+                    
+                    // Send 200 OK for the HTTP response
+                    resp.setStatus(HttpServletResponse.SC_OK);
+                    return;
+                  } catch (Exception e) {
+                    LOG.error("Error in direct executeFunction handling", e);
+                    handleError(resp, e);
+                    return;
+                  }
+                }
+                
+                // Use regular session handling for other methods
+                session.handle(request)
+                    .subscribeOn(reactor.core.scheduler.Schedulers.boundedElastic())
+                    .doOnSubscribe(s -> LOG.info("Request handler subscribed for method: {}", request.method()))
+                    .doOnNext(result -> LOG.info("Got result from handler: {}", result))
+                    .doOnSuccess(result -> {
+                        try {
+                            LOG.info("Processing successful result: {}", result);
+                            // Create JSON-RPC response
+                            Map<String, Object> response = new HashMap<>();
+                            response.put("jsonrpc", "2.0");
+                            response.put("id", request.id());
+                            response.put("result", result);
+                            
+                            // Write response directly to HTTP response
+                            String json = objectMapper.writeValueAsString(response);
+                            responseWriter.write(json);
+                            responseWriter.flush();
+                            LOG.info("Sent response: {}", json);
+                            
+                            future.complete(null);
+                        } catch (Exception e) {
+                            LOG.error("Error sending response", e);
+                            future.completeExceptionally(e);
+                        }
+                    })
+                    .doOnError(error -> {
+                        LOG.error("Handler failed for method: {} with error: {}", request.method(), error.getMessage(), error);
+                        future.completeExceptionally(error);
+                    })
+                    .doOnCancel(() -> LOG.info("Handler cancelled for method: {}", request.method()))
+                    .doFinally(signalType -> LOG.info("Handler finally for method: {} with signal: {}", request.method(), signalType))
+                    .subscribe();
+                    
+                // Wait for completion or timeout
+                try {
+                  future.get(30, TimeUnit.SECONDS);
+                } catch (java.util.concurrent.TimeoutException e) {
+                  LOG.error("Request timed out after 30 seconds for method: {}", request.method());
+                  handleError(resp, new RuntimeException("Request timed out"));
+                  return;
+                }
+                
+                // Send 200 OK for the HTTP response
+                resp.setStatus(HttpServletResponse.SC_OK);
+              } catch (Exception e) {
+                LOG.error("Error handling request", e);
+                handleError(resp, e);
+              }
+            } else {
+              // For notifications, Accepted is appropriate
+              resp.setStatus(HttpServletResponse.SC_ACCEPTED);
+            }
+          } catch (Exception e) {
+            LOG.error("Error processing message", e);
+            handleError(resp, e);
+          }
+        } else if (req.getMethod().equals("GET") && path.contains("/oauth/authorize")) {
+          LOG.info("[{}] Handling OAuth authorize request", requestId);
+          
+          // Extract redirect_uri and state from query parameters
+          String redirectUri = req.getParameter("redirect_uri");
+          String state = req.getParameter("state");
+          String clientId = req.getParameter("client_id");
+          
+          if (redirectUri == null || state == null) {
+            LOG.error("[{}] Missing required OAuth parameters", requestId);
+            resp.sendError(HttpServletResponse.SC_BAD_REQUEST, "Missing required OAuth parameters");
+            return;
+          }
+          
+          LOG.info("[{}] OAuth parameters: redirect_uri={}, state={}, client_id={}", 
+              requestId, redirectUri, state, clientId);
+          
+          // Generate a fake authorization code
+          String code = UUID.randomUUID().toString();
+          
+          // Redirect to the callback URL with the code and state
+          String location = redirectUri + "?code=" + code + "&state=" + state;
+          LOG.info("[{}] Redirecting to: {}", requestId, location);
+          
+          resp.setStatus(HttpServletResponse.SC_FOUND);
+          resp.setHeader("Location", location);
+          resp.getWriter().flush();
+          return;
+        } else if (req.getMethod().equals("POST") && path.contains("/oauth/token")) {
+          LOG.info("[{}] Handling OAuth token request", requestId);
+          
+          // Read the request body
+          String requestBodyStr;
+          StringBuilder requestBody = new StringBuilder();
+          String line;
+          try (BufferedReader reader = req.getReader()) {
+              while ((line = reader.readLine()) != null) {
+                  requestBody.append(line);
+              }
+          }
+          requestBodyStr = requestBody.toString();
+          
+          LOG.info("[{}] Token request body: {}", requestId, requestBodyStr);
+          
+          // Generate a fake token response
+          Map<String, Object> tokenResponse = new HashMap<>();
+          tokenResponse.put("access_token", UUID.randomUUID().toString());
+          tokenResponse.put("token_type", "Bearer");
+          tokenResponse.put("expires_in", 3600);
+          tokenResponse.put("refresh_token", UUID.randomUUID().toString());
+          
+          // Convert to JSON and send
+          String responseJson = objectMapper.writeValueAsString(tokenResponse);
+          LOG.info("[{}] Sending token response: {}", requestId, responseJson);
+          
+          resp.setStatus(HttpServletResponse.SC_OK);
+          resp.setContentType("application/json");
+          resp.getWriter().write(responseJson);
+          resp.getWriter().flush();
+          return;
+        } else if (req.getMethod().equals("GET") && path.contains("/wait-for-auth")) {
+          LOG.info("[{}] Handling wait-for-auth request", requestId);
+          
+          // Generate a fake auth status response
+          Map<String, Object> authStatusResponse = new HashMap<>();
+          authStatusResponse.put("status", "complete");
+          authStatusResponse.put("token", UUID.randomUUID().toString());
+          
+          // Convert to JSON and send
+          String responseJson = objectMapper.writeValueAsString(authStatusResponse);
+          LOG.info("[{}] Sending auth status response: {}", requestId, responseJson);
+          
+          resp.setStatus(HttpServletResponse.SC_OK);
+          resp.setContentType("application/json");
+          resp.getWriter().write(responseJson);
+          resp.getWriter().flush();
+          return;
+        } else {
+          // Only allow GET /sse or POST /message (which is handled above)
+          LOG.warn("[{}] Sending 404 for unexpected request: {} {}", initialRequestId, method, path);
+          resp.sendError(HttpServletResponse.SC_NOT_FOUND);
+        }
       } catch (Exception e) {
-        LOG.error("Error in handleToolsList", e);
-        return objectMapper.createArrayNode(); // Return empty array on error
+        LOG.error("[{}] Error processing request: {}", requestId, e.getMessage(), e);
+        resp.sendError(500, "Internal Server Error: " + e.getMessage());
+      } finally {
+        long endTime = System.currentTimeMillis();
+        LOG.info("[{}] Request completed in {} ms", requestId, (endTime - startTime));
       }
     }
-    
-    private void setCorsHeaders(HttpServletResponse response) {
-      response.setHeader("Access-Control-Allow-Origin", "*");
-      response.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-      response.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Claude-Request-Id, Claude-SDK-Agent");
-      response.setHeader("Access-Control-Max-Age", "3600");
-      response.setHeader("Access-Control-Allow-Credentials", "true");
+
+    /**
+     * Helper method to handle errors consistently
+     */
+    private void handleError(HttpServletResponse resp, Throwable error) {
+        try {
+            Map<String, Object> errorObj = new HashMap<>();
+            errorObj.put("code", McpSchema.ErrorCodes.INTERNAL_ERROR);
+            errorObj.put("message", "Internal error: " + error.getMessage());
+
+            Map<String, Object> errorResponse = new HashMap<>();
+            errorResponse.put("jsonrpc", "2.0");
+            errorResponse.put("id", "error-" + UUID.randomUUID());
+            errorResponse.put("error", errorObj);
+
+            String errorJson = objectMapper.writeValueAsString(errorResponse);
+            LOG.info("Sending error response: {}", errorJson);
+            resp.getWriter().write(errorJson);
+            resp.getWriter().flush();
+            resp.flushBuffer();
+        } catch (Exception e) {
+            LOG.error("Failed to send error response", e);
+        }
     }
+  }
+
+  /**
+   * Creates a session using the simpler approach
+   */
+  private McpServerSession createSession(String sessionId, McpServerTransport transport) {
+    LOG.info("Creating new session with ID: {}", sessionId);
+    
+    // Create handlers
+    Map<String, McpServerSession.RequestHandler<?>> requestHandlers = createRequestHandlers();
+    LOG.info("Created request handlers: {}", requestHandlers.keySet());
+    
+    // Create session
+    McpServerSession session = new McpServerSession(
+        sessionId,
+        transport,
+        createInitHandler(),
+        createInitNotificationHandler(),
+        requestHandlers,
+        createNotificationHandlers()
+    );
+    
+    // Store the session in the map
+    sessions.put(sessionId, session);
+    LOG.info("Created and stored new session with ID: {} and handlers: {}", sessionId, requestHandlers.keySet());
+    return session;
+  }
+
+  /**
+   * Creates the request handlers map.
+   */
+  private Map<String, McpServerSession.RequestHandler<?>> createRequestHandlers() {
+    // Return the cached handlers instead of creating new ones
+    LOG.info("Returning cached handlers: {}", cachedHandlers.keySet());
+    return cachedHandlers;
+  }
+
+  /**
+   * Creates the initialization request handler.
+   */
+  private McpServerSession.InitRequestHandler createInitHandler() {
+    return request -> {
+      // Create server capabilities
+      McpSchema.ServerCapabilities capabilities = McpSchema.ServerCapabilities.builder()
+          .tools(true)  // Enable tools capability
+          .build();
+      
+      // Create server info
+      McpSchema.Implementation serverInfo = new McpSchema.Implementation(
+          mcpConfig.getMcpServerName(),
+          mcpConfig.getMcpServerVersion()
+      );
+      
+      // Create the initialize result
+      McpSchema.InitializeResult result = new McpSchema.InitializeResult(
+          "2024-11-05",  // Protocol version
+          capabilities,   // Server capabilities
+          serverInfo,     // Server info
+          null            // Instructions (optional)
+      );
+      
+      // Return the initialize result
+      return Mono.just(result);
+    };
+  }
+  
+  /**
+   * Creates the initialization notification handler.
+   */
+  private McpServerSession.InitNotificationHandler createInitNotificationHandler() {
+    return () -> Mono.empty();
+  }
+  
+  /**
+   * Creates the notification handlers map.
+   */
+  private Map<String, McpServerSession.NotificationHandler> createNotificationHandlers() {
+    return new HashMap<>();
+  }
+
+  /**
+   * Gets a ServletHolder for this MCP server.
+   * 
+   * @return The servlet holder for registering with Jetty
+   */
+  public ServletHolder getServletHolder() {
+    LOG.info("Creating MCP servlet holder");
+    MCPBridgeServlet servlet = new MCPBridgeServlet();
+    ServletHolder servletHolder = new ServletHolder(servlet);
+    servletHolder.setName("mcp-bridge");
+    return servletHolder;
   }
 }

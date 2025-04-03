@@ -1,0 +1,1 @@
+curl -X POST "http://localhost:8585/api/v1/mcp/jsonrpc" -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"claude-desktop","version":"0.1.0"}}}'

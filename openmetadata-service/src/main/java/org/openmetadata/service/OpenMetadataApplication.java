@@ -126,8 +126,6 @@ import org.openmetadata.service.security.saml.SamlMetadataServlet;
 import org.openmetadata.service.security.saml.SamlSettingsHolder;
 import org.openmetadata.service.security.saml.SamlTokenRefreshServlet;
 import org.openmetadata.service.socket.FeedServlet;
-import org.openmetadata.service.socket.MCPServlet;
-import org.openmetadata.service.socket.MCPWebSocketManager;
 import org.openmetadata.service.socket.OpenMetadataAssetServlet;
 import org.openmetadata.service.socket.SocketAddressFilter;
 import org.openmetadata.service.socket.WebSocketManager;
@@ -191,9 +189,6 @@ public class OpenMetadataApplication extends Application<OpenMetadataApplication
 
     initializeWebsockets(catalogConfig, environment);
     
-    // Initialize MCP server if configured
-    initializeMCPServer(catalogConfig, environment);
-
     // init Secret Manager
     SecretsManagerFactory.createSecretsManager(
         catalogConfig.getSecretsManagerConfiguration(), catalogConfig.getClusterName());
@@ -276,6 +271,12 @@ public class OpenMetadataApplication extends Application<OpenMetadataApplication
 
     // Register Auth Handlers
     registerAuthServlets(catalogConfig, environment);
+
+    // Register MCP Server
+    registerMCPServer(catalogConfig, environment);
+
+    // Register Event Subscriptions
+    registerEventFilter(catalogConfig, environment);
   }
 
   private void registerHealthCheckJobs(OpenMetadataApplicationConfig catalogConfig) {
@@ -622,57 +623,17 @@ public class OpenMetadataApplication extends Application<OpenMetadataApplication
         .addFilter(
             new FilterHolder(socketAddressFilter), pathSpec, EnumSet.of(DispatcherType.REQUEST));
     environment.getApplicationContext().addServlet(new ServletHolder(new FeedServlet()), pathSpec);
-    
-    // Initialize MCP WebSocket if configured
-    if (catalogConfig.getMcpConfiguration() != null && catalogConfig.getMcpConfiguration().isEnabled()) {
-      String mcpPathSpec = "/api" + catalogConfig.getMcpConfiguration().getWebsocketEndpoint() + "/*";
-      
-      LOG.info("Initializing MCP WebSocket endpoint at {}", mcpPathSpec);
-      
-      // Create filter for MCP WebSocket
-      SocketAddressFilter mcpSocketFilter;
-      if (catalogConfig.getAuthorizerConfiguration() != null) {
-        mcpSocketFilter =
-            new SocketAddressFilter(
-                catalogConfig.getAuthenticationConfiguration(),
-                catalogConfig.getAuthorizerConfiguration());
-      } else {
-        mcpSocketFilter = new SocketAddressFilter();
-      }
-      
-      // Add filter and servlet for MCP WebSocket
-      environment
-          .getApplicationContext()
-          .addFilter(
-              new FilterHolder(mcpSocketFilter), mcpPathSpec, EnumSet.of(DispatcherType.REQUEST));
-      environment.getApplicationContext().addServlet(new ServletHolder(new MCPServlet()), mcpPathSpec);
-    }
-    
     // Upgrade connection to websocket from Http
     try {
       WebSocketUpgradeFilter.configure(environment.getApplicationContext());
-      
-      // Configure WebSocket handler for activity feed
       NativeWebSocketServletContainerInitializer.configure(
           environment.getApplicationContext(),
-          (context, container) -> {
-            // Add mapping for activity feed WebSocket
-            container.addMapping(
-                new ServletPathSpec(pathSpec),
-                (servletUpgradeRequest, servletUpgradeResponse) ->
-                    new JettyWebSocketHandler(
-                        WebSocketManager.getInstance().getEngineIoServer()));
-            
-            // Add mapping for MCP WebSocket if enabled
-            if (catalogConfig.getMcpConfiguration() != null && catalogConfig.getMcpConfiguration().isEnabled()) {
-              String mcpPathSpec = "/api" + catalogConfig.getMcpConfiguration().getWebsocketEndpoint() + "/*";
+          (context, container) ->
               container.addMapping(
-                  new ServletPathSpec(mcpPathSpec),
+                  new ServletPathSpec(pathSpec),
                   (servletUpgradeRequest, servletUpgradeResponse) ->
                       new JettyWebSocketHandler(
-                          MCPWebSocketManager.getInstance().getEngineIoServer()));
-            }
-          });
+                          WebSocketManager.getInstance().getEngineIoServer())));
     } catch (ServletException ex) {
       LOG.error("Websocket Upgrade Filter error : " + ex.getMessage());
     }
@@ -683,41 +644,6 @@ public class OpenMetadataApplication extends Application<OpenMetadataApplication
     openMetadataApplication.run(args);
   }
 
-  /**
-   * Initialize the MCP server if it's enabled in the configuration
-   */
-  private void initializeMCPServer(OpenMetadataApplicationConfig config, Environment environment) {
-    if (config.getMcpConfiguration() != null && config.getMcpConfiguration().isEnabled()) {
-      LOG.info("Initializing Model Context Protocol server");
-      mcpServer = new OpenMetadataMCPServer(config.getMcpConfiguration());
-      
-      // Register the JSON-RPC servlet endpoint
-      String jsonRpcEndpoint = config.getMcpConfiguration().getJsonRpcEndpoint();
-      if (!jsonRpcEndpoint.startsWith("/")) {
-        jsonRpcEndpoint = "/" + jsonRpcEndpoint;
-      }
-      String fullEndpoint = "/api" + jsonRpcEndpoint;
-      
-      LOG.info("Registering MCP JSON-RPC endpoint at {}", fullEndpoint);
-      environment.servlets()
-          .addServlet("mcpJsonRpc", mcpServer.getServlet())
-          .addMapping(fullEndpoint);
-      
-      // Set CORS for the MCP endpoint
-      FilterRegistration.Dynamic corsFilter = environment.servlets().addFilter("MCPCorsFilter", 
-          new org.eclipse.jetty.servlets.CrossOriginFilter());
-      corsFilter.setInitParameter("allowedOrigins", "*");
-      corsFilter.setInitParameter("allowedHeaders", "Content-Type,Authorization,X-Requested-With,Content-Length,Accept,Origin");
-      corsFilter.setInitParameter("allowedMethods", "GET,PUT,POST,DELETE,OPTIONS");
-      corsFilter.setInitParameter("preflightMaxAge", "86400");
-      corsFilter.setInitParameter("allowCredentials", "true");
-      corsFilter.addMappingForUrlPatterns(java.util.EnumSet.of(
-          javax.servlet.DispatcherType.REQUEST), true, fullEndpoint);
-      
-      mcpServer.start();
-      LOG.info("Model Context Protocol server initialized and registered at {}", fullEndpoint);
-    }
-  }
 
   public class ManagedShutdown implements Managed {
 
@@ -740,6 +666,23 @@ public class OpenMetadataApplication extends Application<OpenMetadataApplication
       }
       
       LOG.info("Stopping the application");
+    }
+  }
+
+  private void registerMCPServer(OpenMetadataApplicationConfig catalogConfig, Environment environment) {
+    if (catalogConfig.getMcpConfiguration() != null && catalogConfig.getMcpConfiguration().isEnabled()) {
+      LOG.info("Initializing MCP server with configuration: {}", catalogConfig.getMcpConfiguration());
+      mcpServer = new OpenMetadataMCPServer(catalogConfig.getMcpConfiguration());
+      ServletHolder servletHolder = mcpServer.getServletHolder();
+      // Explicitly enable async support for the servlet, as it uses AsyncContext
+      servletHolder.setAsyncSupported(true);
+      String mcpPath = catalogConfig.getMcpConfiguration().getPath() + "/*";
+      LOG.info("Registering MCP servlet at path: {}", mcpPath);
+      environment.getApplicationContext().addServlet(servletHolder, mcpPath);
+      environment.lifecycle().manage(mcpServer);
+      LOG.info("MCP server initialized and registered");
+    } else {
+      LOG.info("MCP server disabled or not configured. Skipping initialization.");
     }
   }
 }

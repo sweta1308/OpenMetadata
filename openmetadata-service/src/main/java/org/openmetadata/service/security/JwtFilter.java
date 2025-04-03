@@ -37,6 +37,7 @@ import java.net.URL;
 import java.security.interfaces.RSAPublicKey;
 import java.util.*;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import javax.ws.rs.container.ContainerRequestContext;
 import javax.ws.rs.container.ContainerRequestFilter;
 import javax.ws.rs.core.MultivaluedMap;
@@ -95,6 +96,10 @@ public class JwtFilter implements ContainerRequestFilter {
           "v1/users/login",
           "v1/users/refresh");
 
+  // Add MCP endpoints to the exclusion list
+  private static final List<String> MCP_ENDPOINTS = 
+      List.of("mcp/sse", "mcp/message");
+
   @SuppressWarnings("unused")
   private JwtFilter() {}
 
@@ -146,7 +151,8 @@ public class JwtFilter implements ContainerRequestFilter {
   @Override
   public void filter(ContainerRequestContext requestContext) {
     UriInfo uriInfo = requestContext.getUriInfo();
-    if (EXCLUDED_ENDPOINTS.stream()
+    // Combine default exclusions and MCP exclusions
+    if (Stream.concat(EXCLUDED_ENDPOINTS.stream(), MCP_ENDPOINTS.stream())
         .anyMatch(endpoint -> uriInfo.getPath().equalsIgnoreCase(endpoint))) {
       return;
     }

@@ -1,0 +1,1 @@
+curl -v -X POST "http://localhost:8585/api/v1/mcp/message?sessionId=06014d6e-83b9-463c-9b6b-9b5c898612a6" -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"claude-ai","version":"0.1.0"}}}'

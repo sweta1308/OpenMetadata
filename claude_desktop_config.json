@@ -1,0 +1,1 @@
+{"mcpServers":{"openmetadata":{"command":"npx","args":["-y","mcp-remote","http://localhost:8585/mcp/sse","--auth-server-url=http://localhost:8585/mcp","--client-id=openmetadata","--verbose","--no-reconnect","--clean"]}}}
