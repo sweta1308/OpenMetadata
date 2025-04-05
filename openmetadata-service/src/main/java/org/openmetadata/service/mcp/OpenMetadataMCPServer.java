@@ -4,20 +4,16 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.dropwizard.lifecycle.Managed;
-import io.modelcontextprotocol.server.transport.WebFluxSseServerTransportProvider;
 import io.modelcontextprotocol.spec.McpSchema;
 import io.modelcontextprotocol.spec.McpServerSession;
 import io.modelcontextprotocol.spec.McpServerTransport;
-import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import org.eclipse.jetty.servlet.ServletHolder;
 import org.openmetadata.common.utils.CommonUtil;
 import org.openmetadata.schema.search.SearchRequest;
 import org.openmetadata.service.Entity;
 import org.openmetadata.service.config.MCPConfiguration;
-import org.openmetadata.service.jdbi3.EntityRepository;
 import org.openmetadata.service.search.SearchRepository;
-import org.openmetadata.service.util.EntityUtil;
 import org.openmetadata.service.util.JsonUtils;
 import reactor.core.publisher.Mono;
 
@@ -42,10 +38,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.net.URL;
-import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CompletableFuture;
-import java.time.Duration;
 
 import static org.openmetadata.service.search.SearchUtil.mapEntityTypesToIndexNames;
 
@@ -55,7 +48,6 @@ import static org.openmetadata.service.search.SearchUtil.mapEntityTypesToIndexNa
  */
 @Slf4j
 public class OpenMetadataMCPServer implements Managed {
-  private static final String MCP_TOOLS_FILE = "json/data/mcp/tools.json";
 
   private final SearchRepository searchRepository;
   private final ExecutorService executorService;
@@ -73,8 +65,6 @@ public class OpenMetadataMCPServer implements Managed {
   private final Map<String, ScheduledFuture<?>> heartbeatTasks = new ConcurrentHashMap<>();
   private List<Map<String, Object>> cachedTools;
   private final Map<String, McpServerSession.RequestHandler<?>> cachedHandlers = new HashMap<>();
-
-  @Getter
   private final ServletHolder servletHolder;
 
   public OpenMetadataMCPServer(MCPConfiguration mcpConfig) {
@@ -82,22 +72,16 @@ public class OpenMetadataMCPServer implements Managed {
     this.searchRepository = Entity.getSearchRepository();
     this.executorService = Executors.newCachedThreadPool();
     this.objectMapper = JsonUtils.getObjectMapper();
-
-    // Create a servlet that bridges to the WebFlux handlers
     HttpServlet bridgeServlet = new MCPBridgeServlet();
     this.servletHolder = new ServletHolder(bridgeServlet);
-
     LOG.info("Initialized MCP server (using Servlet API)");
   }
 
   @Override
   public void start() {
     LOG.info("Starting MCP server with configuration: {}", mcpConfig);
-    // Log server configuration details
     LOG.info("MCP Server name: {}, version: {}", mcpConfig.getMcpServerName(), mcpConfig.getMcpServerVersion());
     LOG.info("MCP Server path: {}", mcpConfig.getPath());
-    
-    // Pre-load tool definitions to verify they're available
     try {
       LOG.info("Loading tool definitions...");
       cachedTools = loadToolDefinitions();
@@ -109,8 +93,6 @@ public class OpenMetadataMCPServer implements Managed {
       for (Map<String, Object> tool : cachedTools) {
         LOG.info("Tool available: {}", tool.get("name"));
       }
-      
-      // Initialize handlers once at startup
       LOG.info("Initializing request handlers...");
       initializeHandlers();
       if (cachedHandlers.isEmpty()) {
@@ -127,18 +109,12 @@ public class OpenMetadataMCPServer implements Managed {
   @Override
   public void stop() {
     LOG.info("Stopping MCP server");
-    
-    // Shut down the executor service
     executorService.shutdown();
-    
-    // Cancel all heartbeat tasks
     for (Map.Entry<String, ScheduledFuture<?>> entry : heartbeatTasks.entrySet()) {
       entry.getValue().cancel(false);
       LOG.info("Canceled heartbeat task for session: {}", entry.getKey());
     }
     heartbeatTasks.clear();
-    
-    // Shut down the heartbeat executor
     try {
       LOG.info("Shutting down heartbeat executor");
       heartbeatExecutor.shutdown();
@@ -151,31 +127,20 @@ public class OpenMetadataMCPServer implements Managed {
       Thread.currentThread().interrupt();
       heartbeatExecutor.shutdownNow();
     }
-    
-    // Close all sessions
     for (McpServerSession session : sessions.values()) {
       session.closeGracefully().subscribe();
     }
     sessions.clear();
-    
     LOG.info("MCP server stopped");
   }
 
-  /**
-   * Loads tool definitions from the configured file.
-   */
   @SuppressWarnings("unchecked")
   private List<Map<String, Object>> loadToolDefinitions() throws IOException {
     try {
-      LOG.info("Starting to load tool definitions");
-      
-      // Load tool definitions directly from the file
       String json = CommonUtil.getResourceAsStream(
               getClass().getClassLoader(), 
               "json/data/mcp/tools.json");
       LOG.info("Loaded tool definitions, content length: {}", json.length());
-      
-      // Log the raw JSON content
       LOG.info("Raw tools.json content: {}", json);
       
       JsonNode toolsJson = JsonUtils.readTree(json);
@@ -186,7 +151,6 @@ public class OpenMetadataMCPServer implements Managed {
         return new ArrayList<>();
       }
       
-      // Convert tool definitions to a list of maps
       List<Map<String, Object>> tools = new ArrayList<>();
       for (JsonNode toolNode : toolsArray) {
         String name = toolNode.get("name").asText();
@@ -203,13 +167,8 @@ public class OpenMetadataMCPServer implements Managed {
     }
   }
 
-  /**
-   * Initialize request handlers once at startup
-   */
   private void initializeHandlers() {
     LOG.info("Initializing request handlers");
-    
-    // Register tools/list request handler
     LOG.info("Registering handler for method: tools/list");
     cachedHandlers.put("tools/list", (exchange, params) -> {
       LOG.info("Starting tools/list handler");
@@ -220,10 +179,8 @@ public class OpenMetadataMCPServer implements Managed {
             LOG.error(error);
             return Mono.error(new RuntimeException(error));
           }
-          
           LOG.info("Found {} cached tools", cachedTools.size());
           List<Map<String, Object>> toolsFormatted = new ArrayList<>();
-          
           for (Map<String, Object> toolDef : cachedTools) {
             try {
               String name = (String) toolDef.get("name");
@@ -240,11 +197,8 @@ public class OpenMetadataMCPServer implements Managed {
               toolsFormatted.add(formattedTool);
             } catch (Exception e) {
               LOG.error("Error processing tool definition: {}", toolDef, e);
-              // Continue processing other tools
             }
           }
-          
-          // Create a proper result object with the expected format
           Map<String, Object> resultObj = new HashMap<>();
           resultObj.put("tools", toolsFormatted);
           
@@ -262,7 +216,6 @@ public class OpenMetadataMCPServer implements Managed {
       .subscribeOn(reactor.core.scheduler.Schedulers.boundedElastic());
     });
     
-    // Register executeFunction request handler
     cachedHandlers.put("executeFunction", (exchange, params) -> {
       return Mono.defer(() -> {
         try {
@@ -292,13 +245,9 @@ public class OpenMetadataMCPServer implements Managed {
     });
   }
 
-  /**
-   * Executes the search_metadata tool.
-   */
   private Map<String, Object> searchMetadata(Map<String, Object> params) {
     try {
       LOG.info("Executing searchMetadata with params: {}", params);
-      
       String query = params.containsKey("query") ? (String) params.get("query") : "*";
       int limit = 10;
       if (params.containsKey("limit")) {
@@ -354,22 +303,13 @@ public class OpenMetadataMCPServer implements Managed {
     }
   }
 
-  /**
-   * Get details for a specific entity by its FQN.
-   *
-   * @param params The parameters from the request
-   * @return The entity details
-   */
   private Object getEntityDetails(Map<String, Object> params) {
     try {
       String entityType = (String) params.get("entity_type");
       String fqn = (String) params.get("fqn");
       
       LOG.info("Getting details for entity type: {}, FQN: {}", entityType, fqn);
-      
-      // Include all fields
       String fields = "*";
-      
       Object entity = Entity.getEntityByName(entityType, fqn, fields, null);
       return entity;
     } catch (Exception e) {
@@ -378,15 +318,12 @@ public class OpenMetadataMCPServer implements Managed {
     }
   }
 
-  /**
-   * A servlet that bridges HTTP requests to the WebFlux router functions.
-   */
+
   private class MCPBridgeServlet extends HttpServlet {
     @Override
     protected void service(HttpServletRequest req, HttpServletResponse resp) 
             throws IOException {
       
-      // Add logging at the very start of the service method
       String initialRequestId = req.getHeader("X-Request-ID"); // Or generate one if needed
       if (initialRequestId == null) { initialRequestId = UUID.randomUUID().toString().substring(0, 8); }
       LOG.info("[{}] MCPBridgeServlet service() entered for: {} {}", 
@@ -394,8 +331,7 @@ public class OpenMetadataMCPServer implements Managed {
       
       String path = req.getRequestURI();
       String method = req.getMethod();
-      
-      // Track request timing
+
       long startTime = System.currentTimeMillis();
       String requestId = UUID.randomUUID().toString().substring(0, 8);
       
@@ -428,14 +364,13 @@ public class OpenMetadataMCPServer implements Managed {
           resp.setHeader("Expires", "0");
           resp.setHeader("Connection", "keep-alive");
           
-          // Basic CORS headers
           resp.setHeader("Access-Control-Allow-Origin", "*");
           resp.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
           resp.setHeader("Access-Control-Allow-Headers", "*");
           
           resp.setStatus(HttpServletResponse.SC_OK);
           
-          // Handle CORS preflight requests
+
           if (req.getMethod().equals("OPTIONS")) {
             LOG.info("[{}] Handling CORS preflight request", requestId);
             resp.setHeader("Access-Control-Max-Age", "86400"); // 24 hours
@@ -444,26 +379,15 @@ public class OpenMetadataMCPServer implements Managed {
             return;
           }
           
-          // Switch to asynchronous mode
           final AsyncContext asyncContext = req.startAsync();
-          
-          // Set a very long timeout to effectively disable it
           asyncContext.setTimeout(3600000); // 1 hour
-          
-          // Generate a session ID
+
           final String sessionId = UUID.randomUUID().toString();
           LOG.info("[{}] Created new SSE session: {}", requestId, sessionId);
-          
-          // Keep track of whether the connection is closed
           final AtomicBoolean closed = new AtomicBoolean(false);
-          
-          // Create an async writer to handle background writing
           PrintWriter writer = resp.getWriter();
-          
-          // Write the initial endpoint event
           String messageEndpoint = mcpConfig.getPath() + "/message?sessionId=" + sessionId;
-          
-          // Use the server's host from configuration instead of hardcoding localhost
+
           String serverHost = req.getServerName();
           int serverPort = req.getServerPort();
           String fullMessageEndpoint = "http://" + serverHost + ":" + serverPort + messageEndpoint;
@@ -474,7 +398,6 @@ public class OpenMetadataMCPServer implements Managed {
           LOG.info("[{}] Sent initial endpoint event for session: {}", requestId, sessionId);
           LOG.info("[{}] Message endpoint URL: {}", requestId, fullMessageEndpoint);
           
-          // Create a transport that writes directly to the writer
           McpServerTransport transport = new McpServerTransport() {
               private final PrintWriter asyncWriter = asyncContext.getResponse().getWriter();
               
@@ -524,10 +447,7 @@ public class OpenMetadataMCPServer implements Managed {
               }
           };
           
-          // Create a session using the simpler approach
           McpServerSession session = createSession(sessionId, transport);
-          
-          // Send initial heartbeat with the exact format expected
           try {
               writer.write("event: heartbeat\n");
               writer.write("data: {\"timestamp\":" + System.currentTimeMillis() + "}\n\n");
@@ -537,7 +457,6 @@ public class OpenMetadataMCPServer implements Managed {
               LOG.error("[{}] Error sending initial heartbeat: {}", requestId, e.getMessage());
           }
           
-          // Create a thread to send periodic heartbeats
           Thread heartbeatThread = new Thread(() -> {
               try {
                   Thread.currentThread().setName("mcp-heartbeat-" + sessionId.substring(0, 8));
@@ -604,7 +523,6 @@ public class OpenMetadataMCPServer implements Managed {
           heartbeatThread.setDaemon(true);
           heartbeatThread.start();
           
-          // Set a listener to detect when the client disconnects
           asyncContext.addListener(new AsyncListener() {
               @Override
               public void onComplete(AsyncEvent event) {
@@ -627,37 +545,25 @@ public class OpenMetadataMCPServer implements Managed {
               
               @Override
               public void onStartAsync(AsyncEvent event) {
-                  // Nothing to do
               }
               
               private void cleanup() {
-                  // Mark the connection as closed
                   closed.set(true);
-                  
-                  // Remove the session
                   sessions.remove(sessionId);
-                  
-                  // Interrupt the heartbeat thread
                   heartbeatThread.interrupt();
-                  
                   LOG.info("Cleaned up resources for session: {}", sessionId);
               }
           });
-          
-          // The request is now being handled asynchronously, so return from the service method
           return;
         } else if (req.getMethod().equals("POST") && 
                   (path.contains("/message"))) {
           LOG.info("[{}] Entered POST /message handler for path: {}", requestId, path);
-          // Handle JSON-RPC message
           resp.setContentType("application/json");
-          
-          // Add CORS headers for the POST message endpoint as well
+
           resp.setHeader("Access-Control-Allow-Origin", "*");
           resp.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
           resp.setHeader("Access-Control-Allow-Headers", "*");
           
-          // Handle potential CORS preflight (OPTIONS) request for this endpoint
           if (req.getMethod().equals("OPTIONS")) {
               LOG.info("[{}] Handling CORS preflight request for /message", requestId);
               resp.setHeader("Access-Control-Max-Age", "86400"); // 24 hours
@@ -666,11 +572,9 @@ public class OpenMetadataMCPServer implements Managed {
               return;
           }
           
-          // Get the session ID from the query parameter
           String sessionId = req.getParameter("sessionId");
           if (sessionId == null) {
             LOG.warn("[{}] No session ID provided in POST request", requestId);
-            // Try to extract from URL path as fallback
             String[] pathParts = path.split("/");
             for (int i = 0; i < pathParts.length - 1; i++) {
               if (pathParts[i].equals("message") && i + 1 < pathParts.length) {
@@ -688,7 +592,6 @@ public class OpenMetadataMCPServer implements Managed {
             }
           }
           
-          // Get the session from the map
           McpServerSession session = sessions.get(sessionId);
           if (session == null) {
             LOG.error("[{}] Session not found: {}", requestId, sessionId);
@@ -700,48 +603,38 @@ public class OpenMetadataMCPServer implements Managed {
           
           LOG.info("[{}] Processing JSON-RPC message for session: {}", requestId, sessionId);
           
-          // Read the request body here, inside the specific handler
           String requestBodyStr;
-          // Read the request body directly
           StringBuilder requestBody = new StringBuilder();
           String line;
           try (BufferedReader reader = req.getReader()) {
               while ((line = reader.readLine()) != null) {
                   requestBody.append(line);
               }
-          } // try-with-resources ensures reader is closed
+          }
           requestBodyStr = requestBody.toString();
-          
-          // Parse and handle the JSON-RPC message
           try {
             McpSchema.JSONRPCMessage message = McpSchema.deserializeJsonRpcMessage(objectMapper, requestBodyStr);
             LOG.info("Processing message: {} (type: {})", message, message.getClass().getSimpleName());
-            
-            // Also log the raw request body for debugging
             if (requestBodyStr.length() < 1000) {
               LOG.info("Raw request body: {}", requestBodyStr);
             } else {
               LOG.info("Raw request body (truncated): {}", requestBodyStr.substring(0, 1000));
             }
             
-            // Process the message through the session
             if (message instanceof McpSchema.JSONRPCRequest request) {
               LOG.info("Passing request to session handler: method={}, id={}, available handlers={}", 
                   request.method(), 
                   request.id(),
                   createRequestHandlers().keySet());
               try {
-                // Create a CompletableFuture to track completion
                 CompletableFuture<Void> future = new CompletableFuture<>();
                 final PrintWriter responseWriter = resp.getWriter();
                 
                 LOG.info("About to handle request with method: {}", request.method());
 
-                // Special handling for tools/list method to bypass session handler
                 if ("tools/list".equals(request.method())) {
                   LOG.info("Handling tools/list method directly instead of through session");
                   try {
-                    // Create a proper result object with the expected format
                     Map<String, Object> resultObj = new HashMap<>();
                     List<Map<String, Object>> formattedTools = new ArrayList<>();
                     
@@ -790,10 +683,7 @@ public class OpenMetadataMCPServer implements Managed {
                     handleError(resp, e);
                     return;
                   }
-                }
-                
-                // Special handling for executeFunction method to bypass session handler
-                else if ("executeFunction".equals(request.method())) {
+                } else if ("executeFunction".equals(request.method())) {
                   LOG.info("Handling executeFunction method directly instead of through session");
                   try {
                     Map<String, Object> paramsMap = objectMapper.convertValue(request.params(), Map.class);
@@ -836,8 +726,7 @@ public class OpenMetadataMCPServer implements Managed {
                     return;
                   }
                 }
-                
-                // Use regular session handling for other methods
+
                 session.handle(request)
                     .subscribeOn(reactor.core.scheduler.Schedulers.boundedElastic())
                     .doOnSubscribe(s -> LOG.info("Request handler subscribed for method: {}", request.method()))
@@ -871,7 +760,6 @@ public class OpenMetadataMCPServer implements Managed {
                     .doFinally(signalType -> LOG.info("Handler finally for method: {} with signal: {}", request.method(), signalType))
                     .subscribe();
                     
-                // Wait for completion or timeout
                 try {
                   future.get(30, TimeUnit.SECONDS);
                 } catch (java.util.concurrent.TimeoutException e) {
@@ -880,14 +768,12 @@ public class OpenMetadataMCPServer implements Managed {
                   return;
                 }
                 
-                // Send 200 OK for the HTTP response
                 resp.setStatus(HttpServletResponse.SC_OK);
               } catch (Exception e) {
                 LOG.error("Error handling request", e);
                 handleError(resp, e);
               }
             } else {
-              // For notifications, Accepted is appropriate
               resp.setStatus(HttpServletResponse.SC_ACCEPTED);
             }
           } catch (Exception e) {
@@ -897,7 +783,6 @@ public class OpenMetadataMCPServer implements Managed {
         } else if (req.getMethod().equals("GET") && path.contains("/oauth/authorize")) {
           LOG.info("[{}] Handling OAuth authorize request", requestId);
           
-          // Extract redirect_uri and state from query parameters
           String redirectUri = req.getParameter("redirect_uri");
           String state = req.getParameter("state");
           String clientId = req.getParameter("client_id");
@@ -910,22 +795,17 @@ public class OpenMetadataMCPServer implements Managed {
           
           LOG.info("[{}] OAuth parameters: redirect_uri={}, state={}, client_id={}", 
               requestId, redirectUri, state, clientId);
-          
-          // Generate a fake authorization code
+
           String code = UUID.randomUUID().toString();
-          
-          // Redirect to the callback URL with the code and state
+
           String location = redirectUri + "?code=" + code + "&state=" + state;
           LOG.info("[{}] Redirecting to: {}", requestId, location);
           
           resp.setStatus(HttpServletResponse.SC_FOUND);
           resp.setHeader("Location", location);
           resp.getWriter().flush();
-          return;
         } else if (req.getMethod().equals("POST") && path.contains("/oauth/token")) {
           LOG.info("[{}] Handling OAuth token request", requestId);
-          
-          // Read the request body
           String requestBodyStr;
           StringBuilder requestBody = new StringBuilder();
           String line;
@@ -938,14 +818,11 @@ public class OpenMetadataMCPServer implements Managed {
           
           LOG.info("[{}] Token request body: {}", requestId, requestBodyStr);
           
-          // Generate a fake token response
           Map<String, Object> tokenResponse = new HashMap<>();
           tokenResponse.put("access_token", UUID.randomUUID().toString());
           tokenResponse.put("token_type", "Bearer");
           tokenResponse.put("expires_in", 3600);
           tokenResponse.put("refresh_token", UUID.randomUUID().toString());
-          
-          // Convert to JSON and send
           String responseJson = objectMapper.writeValueAsString(tokenResponse);
           LOG.info("[{}] Sending token response: {}", requestId, responseJson);
           
@@ -953,16 +830,11 @@ public class OpenMetadataMCPServer implements Managed {
           resp.setContentType("application/json");
           resp.getWriter().write(responseJson);
           resp.getWriter().flush();
-          return;
         } else if (req.getMethod().equals("GET") && path.contains("/wait-for-auth")) {
           LOG.info("[{}] Handling wait-for-auth request", requestId);
-          
-          // Generate a fake auth status response
           Map<String, Object> authStatusResponse = new HashMap<>();
           authStatusResponse.put("status", "complete");
           authStatusResponse.put("token", UUID.randomUUID().toString());
-          
-          // Convert to JSON and send
           String responseJson = objectMapper.writeValueAsString(authStatusResponse);
           LOG.info("[{}] Sending auth status response: {}", requestId, responseJson);
           
@@ -970,7 +842,6 @@ public class OpenMetadataMCPServer implements Managed {
           resp.setContentType("application/json");
           resp.getWriter().write(responseJson);
           resp.getWriter().flush();
-          return;
         } else {
           // Only allow GET /sse or POST /message (which is handled above)
           LOG.warn("[{}] Sending 404 for unexpected request: {} {}", initialRequestId, method, path);
@@ -985,9 +856,6 @@ public class OpenMetadataMCPServer implements Managed {
       }
     }
 
-    /**
-     * Helper method to handle errors consistently
-     */
     private void handleError(HttpServletResponse resp, Throwable error) {
         try {
             Map<String, Object> errorObj = new HashMap<>();
@@ -1010,17 +878,10 @@ public class OpenMetadataMCPServer implements Managed {
     }
   }
 
-  /**
-   * Creates a session using the simpler approach
-   */
   private McpServerSession createSession(String sessionId, McpServerTransport transport) {
     LOG.info("Creating new session with ID: {}", sessionId);
-    
-    // Create handlers
     Map<String, McpServerSession.RequestHandler<?>> requestHandlers = createRequestHandlers();
     LOG.info("Created request handlers: {}", requestHandlers.keySet());
-    
-    // Create session
     McpServerSession session = new McpServerSession(
         sessionId,
         transport,
@@ -1030,7 +891,6 @@ public class OpenMetadataMCPServer implements Managed {
         createNotificationHandlers()
     );
     
-    // Store the session in the map
     sessions.put(sessionId, session);
     LOG.info("Created and stored new session with ID: {} and handlers: {}", sessionId, requestHandlers.keySet());
     return session;
@@ -1045,54 +905,36 @@ public class OpenMetadataMCPServer implements Managed {
     return cachedHandlers;
   }
 
-  /**
-   * Creates the initialization request handler.
-   */
+
   private McpServerSession.InitRequestHandler createInitHandler() {
     return request -> {
-      // Create server capabilities
       McpSchema.ServerCapabilities capabilities = McpSchema.ServerCapabilities.builder()
-          .tools(true)  // Enable tools capability
+          .tools(true)
           .build();
-      
-      // Create server info
       McpSchema.Implementation serverInfo = new McpSchema.Implementation(
           mcpConfig.getMcpServerName(),
           mcpConfig.getMcpServerVersion()
       );
       
-      // Create the initialize result
       McpSchema.InitializeResult result = new McpSchema.InitializeResult(
           "2024-11-05",  // Protocol version
           capabilities,   // Server capabilities
           serverInfo,     // Server info
           null            // Instructions (optional)
       );
-      
-      // Return the initialize result
       return Mono.just(result);
     };
   }
   
-  /**
-   * Creates the initialization notification handler.
-   */
+
   private McpServerSession.InitNotificationHandler createInitNotificationHandler() {
     return () -> Mono.empty();
   }
-  
-  /**
-   * Creates the notification handlers map.
-   */
+
   private Map<String, McpServerSession.NotificationHandler> createNotificationHandlers() {
     return new HashMap<>();
   }
 
-  /**
-   * Gets a ServletHolder for this MCP server.
-   * 
-   * @return The servlet holder for registering with Jetty
-   */
   public ServletHolder getServletHolder() {
     LOG.info("Creating MCP servlet holder");
     MCPBridgeServlet servlet = new MCPBridgeServlet();
